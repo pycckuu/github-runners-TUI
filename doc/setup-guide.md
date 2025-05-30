@@ -131,6 +131,52 @@ chmod +x health_check.sh
 
 This script performs health checks on all runners and reports their status.
 
+#### Updating Runners
+
+GitHub regularly releases updates to the self-hosted runner software with security patches and new features. Use the update script to keep all your runners current:
+
+```bash
+# Update ALL runners across ALL repositories
+./update_all.sh
+```
+
+**What the update script does:**
+- Automatically discovers all repositories and runners
+- Stops each runner service safely
+- Updates the runner binary to the latest version
+- Restarts the service and verifies it's running
+- Processes all runners sequentially to avoid conflicts
+
+**When to update:**
+- Monthly maintenance (recommended)
+- After GitHub security advisories
+- When experiencing runner issues
+- Before major GitHub Actions feature rollouts
+
+**Update process for each runner:**
+1. `sudo ./svc.sh stop` - Gracefully stop the service
+2. `./bin/Runner.Listener update` - Download and install latest version
+3. `sudo ./svc.sh start` - Restart with new version
+
+⚠️ **Note:** Updates may take 5-10 minutes per runner. Running jobs will complete before the service stops.
+
+**Manual update for specific repository:**
+```bash
+cd ~/action-runners/myrepo/1
+sudo ./svc.sh stop
+./bin/Runner.Listener update
+sudo ./svc.sh start
+```
+
+**Verify updates:**
+```bash
+# Check all runners are running after update
+./manage_all.sh status
+
+# View update logs if needed
+sudo journalctl -u actions.runner.* --since "1 hour ago"
+```
+
 ## Usage Guide
 
 ### Setting Up Runners for a Repository
@@ -519,32 +565,6 @@ sudo journalctl --vacuum-size=1G
 # Set up cron job for health checks
 crontab -e
 # Add: */5 * * * * /home/$(whoami)/action-runners/health_check.sh >> /var/log/runner-health.log 2>&1
-```
-
-### Update All Runners
-```bash
-cat > ~/action-runners/update_all.sh << 'EOF'
-#!/bin/bash
-cd ~/action-runners
-for repo_dir in */; do
-    if [ -d "$repo_dir" ] && [ "$repo_dir" != "*/" ]; then
-        repo_name=${repo_dir%/}
-        echo "Updating runners for $repo_name..."
-
-        for runner_dir in "$repo_dir"*/; do
-            if [ -d "$runner_dir" ] && [ -f "$runner_dir/config.sh" ]; then
-                cd "$runner_dir"
-                sudo ./svc.sh stop
-                ./bin/Runner.Listener update
-                sudo ./svc.sh start
-                cd ~/action-runners
-            fi
-        done
-    fi
-done
-EOF
-
-chmod +x ~/action-runners/update_all.sh
 ```
 
 ## Performance Optimization
