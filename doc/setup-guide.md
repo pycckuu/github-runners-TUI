@@ -32,459 +32,77 @@ cd ~/action-runners
 
 ### 2. Create the Setup Script
 
-Save this script as `setup_runners.sh`:
+Use the existing setup script in the repository:
 
 ```bash
-cat > ~/action-runners/setup_runners.sh << 'EOF'
-#!/bin/bash
-set -e
-
-# Check if required arguments are provided
-if [ "$#" -lt 1 ]; then
-    echo "Usage: $0 <github-repo> [num-runners]"
-    echo "Example: $0 myorg/myrepo 4"
-    echo "Note: If number of runners is not provided, 4 will be used as default."
-    exit 1
-fi
-
-# Configuration variables
-GITHUB_REPO=$1
-NUM_RUNNERS=${2:-4}  # Use the second argument or default to 4 runners
-REPO_NAME=$(echo "$GITHUB_REPO" | cut -d'/' -f2)  # Extract repo name from org/repo
-REPO_URL="https://github.com/${GITHUB_REPO}"
-BASE_DIR="$HOME/action-runners/${REPO_NAME}"
-RUNNER_VERSION="2.314.1"  # Update this to the latest version if needed
-ARCHITECTURE="x64"  # Change to arm64 if needed
-OS="linux"          # Change to darwin for macOS or win for Windows
-
-echo "Setting up ${NUM_RUNNERS} runners for repository: ${GITHUB_REPO}"
-echo "Using base directory: ${BASE_DIR}"
-
-# Function to set up a runner
-setup_runner() {
-    local runner_number=$1
-    local runner_dir="${BASE_DIR}/${runner_number}"
-    local runner_name="${REPO_NAME}-runner-${runner_number}"
-
-    echo "Setting up runner ${runner_number} in ${runner_dir}..."
-
-    # Create directory if it doesn't exist
-    mkdir -p "${runner_dir}"
-
-    # Enter the runner directory
-    cd "${runner_dir}"
-
-    # Download the runner if not already present
-    if [ ! -f "actions-runner-${OS}-${ARCHITECTURE}.tar.gz" ]; then
-        echo "Downloading runner package..."
-        curl -o "actions-runner-${OS}-${ARCHITECTURE}.tar.gz" -L "https://github.com/actions/runner/releases/download/v${RUNNER_VERSION}/actions-runner-${OS}-${ARCHITECTURE}-${RUNNER_VERSION}.tar.gz"
-    fi
-
-    # Extract the runner if not already extracted
-    if [ ! -f "./config.sh" ]; then
-        echo "Extracting runner package..."
-        tar xzf "./actions-runner-${OS}-${ARCHITECTURE}.tar.gz"
-    fi
-
-    # Check for existing runner configuration
-    if [ -f "./.runner" ]; then
-        echo "Runner ${runner_number} is already configured. Skipping configuration."
-        return 0
-    fi
-
-    # Prompt for token if not already provided
-    if [ -z "$TOKEN" ]; then
-        echo "Please enter your GitHub runner registration token:"
-        read -r TOKEN
-    fi
-
-    # Configure the runner
-    echo "Configuring runner ${runner_number}..."
-    ./config.sh --url "$REPO_URL" --token "$TOKEN" --name "$runner_name" \
-                --labels "self-hosted,linux,x64,${REPO_NAME}" --work "_work" --unattended
-
-    # Set up concurrent job processing (optional)
-    echo '{"workJobConcurrency":"2"}' > .runner.jitconfig
-
-    # Install as a service if user wants to
-    echo "Do you want to install runner ${runner_number} as a service? (y/n)"
-    read -r install_service
-
-    if [[ "$install_service" == "y" || "$install_service" == "Y" ]]; then
-        sudo ./svc.sh install
-        sudo ./svc.sh start
-        echo "Runner ${runner_number} installed and started as a service."
-    else
-        echo "To start the runner manually, use: cd ${runner_dir} && ./run.sh"
-    fi
-}
-
-# Main script
-echo "Setting up ${NUM_RUNNERS} GitHub runners for repository..."
-
-# Create directories if they don't exist
-for i in $(seq 1 $NUM_RUNNERS); do
-    mkdir -p "${BASE_DIR}/${i}"
-done
-
-# Prompt for GitHub token
-echo "Please enter your GitHub runner registration token:"
-read -r TOKEN
-
-# Set up each runner
-for i in $(seq 1 $NUM_RUNNERS); do
-    setup_runner "$i"
-done
-
-echo "All ${NUM_RUNNERS} runners have been set up!"
-echo "You can verify they are connected in your GitHub repository settings under Actions > Runners."
-echo ""
-echo "To manage your runners:"
-echo "- View status: Visit your repository's Settings > Actions > Runners page"
-echo "- Update runners: cd into each runner directory and run ./bin/Runner.Listener update"
-echo "- Remove runners: cd into each runner directory and run ./config.sh remove --token YOUR_REMOVAL_TOKEN"
-
-# Provide instructions for workflow usage
-echo ""
-echo "To use these runners in your workflows, add this to your .github/workflows/*.yml files:"
-echo "jobs:"
-echo "  your_job_name:"
-echo "    runs-on: self-hosted"
-echo "    # Or specifically target your runners with:"
-echo "    # runs-on: [self-hosted, ${REPO_NAME}]"
-EOF
-
-chmod +x ~/action-runners/setup_runners.sh
+chmod +x setup_runners.sh
+./setup_runners.sh myorg/myrepo 4
 ```
 
-### 3. Create Management Scripts
+This script handles the complete setup of multiple GitHub self-hosted runners, including downloading, configuring, and optionally installing them as system services.
 
-#### Repository-Specific Management Script (`manage_repo.sh`)
+### 3. Set Up Build Environment
+
+Run the build environment setup script:
 
 ```bash
-cat > ~/action-runners/manage_repo.sh << 'EOF'
-#!/bin/bash
-
-if [ "$#" -lt 2 ]; then
-    echo "Usage: $0 <repo-name> <action>"
-    echo "Actions: start, stop, restart, status, logs, debug"
-    echo "Example: $0 viaduct status"
-    exit 1
-fi
-
-REPO_NAME=$1
-ACTION=$2
-
-# Function to find services for a repository
-find_repo_services() {
-    local repo=$1
-    # Look for services that contain the repo name and end with -runner-[number]
-    sudo systemctl list-units --all --type=service | grep "actions.runner.*${repo}-runner-" | awk '{print $1}'
-}
-
-# Function to debug service discovery
-debug_services() {
-    echo "Debug information for repository: $REPO_NAME"
-    echo "Looking for services containing: ${REPO_NAME}-runner-"
-    echo ""
-
-    echo "All GitHub Actions runner services on this system:"
-    sudo systemctl list-units --all --type=service | grep actions.runner || echo "No GitHub Actions runner services found"
-    echo ""
-
-    echo "Services for repository '$REPO_NAME':"
-    local services=$(find_repo_services "$REPO_NAME")
-    if [ -z "$services" ]; then
-        echo "No services found for repository '$REPO_NAME'"
-        echo ""
-        echo "Possible issues:"
-        echo "1. Runners were not installed as services (answered 'n' during setup)"
-        echo "2. Service names are different than expected"
-        echo "3. Repository name doesn't match the service naming pattern"
-        echo ""
-        echo "Runner directories found:"
-        ls ~/action-runners/$REPO_NAME/*/run.sh 2>/dev/null || echo "No runner directories found"
-    else
-        echo "$services"
-    fi
-}
-
-case $ACTION in
-    start|stop|restart)
-        services=$(find_repo_services "$REPO_NAME")
-        if [ -z "$services" ]; then
-            echo "No services found for repository: $REPO_NAME"
-            echo "Run '$0 $REPO_NAME debug' for more information"
-            exit 1
-        fi
-
-        echo "${ACTION^}ing runners for repository: $REPO_NAME"
-        for service in $services; do
-            echo "  $ACTION $service"
-            sudo systemctl $ACTION "$service"
-        done
-        ;;
-    status)
-        services=$(find_repo_services "$REPO_NAME")
-        if [ -z "$services" ]; then
-            echo "No services found for repository: $REPO_NAME"
-            echo "Run '$0 $REPO_NAME debug' for more information"
-            exit 1
-        fi
-
-        echo "Status for repository: $REPO_NAME"
-        for service in $services; do
-            echo ""
-            echo "Service: $service"
-            sudo systemctl status "$service" --no-pager -l
-        done
-        ;;
-    logs)
-        services=$(find_repo_services "$REPO_NAME")
-        if [ -z "$services" ]; then
-            echo "No services found for repository: $REPO_NAME"
-            echo "Run '$0 $REPO_NAME debug' for more information"
-            exit 1
-        fi
-
-        echo "Following logs for repository: $REPO_NAME (Ctrl+C to exit)"
-        service_args=""
-        for service in $services; do
-            service_args="$service_args -u $service"
-        done
-        sudo journalctl -f $service_args
-        ;;
-    debug)
-        debug_services
-        ;;
-    *)
-        echo "Invalid action: $ACTION"
-        echo "Valid actions: start, stop, restart, status, logs, debug"
-        exit 1
-        ;;
-esac
-EOF
-
-chmod +x ~/action-runners/manage_repo.sh
+chmod +x setup_build_environment.sh
+./setup_build_environment.sh
 ```
 
-#### Global Management Script (`manage_all.sh`)
+This script installs essential build tools including `build-essential`, `pkg-config`, `libssl-dev`, and other dependencies required for compiling Rust projects.
+
+### 4. Set Up Rust Environment
+
+Run the comprehensive Rust setup script:
 
 ```bash
-cat > ~/action-runners/manage_all.sh << 'EOF'
-#!/bin/bash
-
-if [ "$#" -lt 1 ]; then
-    echo "Usage: $0 <action>"
-    echo "Actions: start, stop, restart, status, logs, list"
-    echo "Example: $0 status"
-    exit 1
-fi
-
-ACTION=$1
-
-# Function to find all GitHub runner services
-find_all_runner_services() {
-    sudo systemctl list-units --all --type=service | grep "actions.runner" | awk '{print $1}'
-}
-
-case $ACTION in
-    start|stop|restart)
-        services=$(find_all_runner_services)
-        if [ -z "$services" ]; then
-            echo "No GitHub runner services found"
-            exit 1
-        fi
-
-        echo "${ACTION^}ing ALL GitHub runners..."
-        for service in $services; do
-            echo "  $ACTION $service"
-            sudo systemctl $ACTION "$service"
-        done
-        ;;
-    status)
-        services=$(find_all_runner_services)
-        if [ -z "$services" ]; then
-            echo "No GitHub runner services found"
-            exit 1
-        fi
-
-        echo "Status of ALL GitHub runners:"
-        for service in $services; do
-            echo ""
-            echo "Service: $service"
-            sudo systemctl status "$service" --no-pager -l
-        done
-        ;;
-    logs)
-        services=$(find_all_runner_services)
-        if [ -z "$services" ]; then
-            echo "No GitHub runner services found"
-            exit 1
-        fi
-
-        echo "Following logs for ALL GitHub runners (Ctrl+C to exit):"
-        service_args=""
-        for service in $services; do
-            service_args="$service_args -u $service"
-        done
-        sudo journalctl -f $service_args
-        ;;
-    list)
-        ./list_repos.sh
-        ;;
-    *)
-        echo "Invalid action: $ACTION"
-        echo "Valid actions: start, stop, restart, status, logs, list"
-        exit 1
-        ;;
-esac
-EOF
-
-chmod +x ~/action-runners/manage_all.sh
+chmod +x setup_rust_environment.sh
+./setup_rust_environment.sh
 ```
 
-#### Repository Listing Script (`list_repos.sh`)
+This script:
+- Installs Rust via rustup with the stable toolchain
+- Adds rustfmt and clippy components
+- Installs nightly toolchain with miri for undefined behavior detection
+- Installs useful cargo tools like `cargo-audit` and `typos-cli`
+- Configures the environment in your shell profile
+
+### 5. Create Management Scripts
+
+The repository includes several management scripts for operating your runners:
+
+#### Repository-Specific Management Script
 
 ```bash
-cat > ~/action-runners/list_repos.sh << 'EOF'
-#!/bin/bash
-echo "GitHub Runner Repositories and Services:"
-echo "========================================"
-
-cd ~/action-runners
-for repo_dir in */; do
-    if [ -d "$repo_dir" ] && [ "$repo_dir" != "*/" ]; then
-        repo_name=${repo_dir%/}
-        echo ""
-        echo "Repository: $repo_name"
-        echo "Runners:"
-
-        runner_count=0
-        for runner_dir in "$repo_dir"*/; do
-            if [ -d "$runner_dir" ]; then
-                runner_num=${runner_dir%/}
-                runner_num=${runner_num##*/}
-
-                # Find the actual service name for this runner
-                service_name=$(sudo systemctl list-units --all --type=service | grep "actions.runner.*${repo_name}-runner-${runner_num}" | awk '{print $1}')
-
-                if [ -n "$service_name" ]; then
-                    status=$(sudo systemctl is-active "$service_name" 2>/dev/null || echo "unknown")
-                    echo "  - Runner $runner_num ($service_name): $status"
-                else
-                    echo "  - Runner $runner_num: not-a-service (manual start required)"
-                fi
-                ((runner_count++))
-            fi
-        done
-        echo "  Total runners: $runner_count"
-    fi
-done
-EOF
-
-chmod +x ~/action-runners/list_repos.sh
+chmod +x manage_repo.sh
 ```
 
-#### Health Check Script (`health_check.sh`)
+This script allows you to manage all runners for a specific repository with commands like `start`, `stop`, `restart`, `status`, `logs`, and `debug`.
+
+#### Global Management Script
 
 ```bash
-cat > ~/action-runners/health_check.sh << 'EOF'
-#!/bin/bash
-
-echo "GitHub Runners Health Check"
-echo "=========================="
-echo "Timestamp: $(date)"
-echo ""
-
-total_runners=0
-active_runners=0
-failed_runners=0
-
-cd ~/action-runners
-for repo_dir in */; do
-    if [ -d "$repo_dir" ] && [ "$repo_dir" != "*/" ]; then
-        repo_name=${repo_dir%/}
-
-        for runner_dir in "$repo_dir"*/; do
-            if [ -d "$runner_dir" ]; then
-                runner_num=${runner_dir%/}
-                runner_num=${runner_num##*/}
-
-                # Find the actual service name for this runner
-                service_name=$(sudo systemctl list-units --all --type=service | grep "actions.runner.*${repo_name}-runner-${runner_num}" | awk '{print $1}')
-
-                if [ -n "$service_name" ]; then
-                    ((total_runners++))
-
-                    status=$(sudo systemctl is-active "$service_name" 2>/dev/null)
-                    if [ "$status" = "active" ]; then
-                        ((active_runners++))
-                    else
-                        ((failed_runners++))
-                        echo "❌ FAILED: $service_name ($status)"
-                    fi
-                fi
-            fi
-        done
-    fi
-done
-
-echo ""
-echo "Summary:"
-echo "  Total runners: $total_runners"
-echo "  Active runners: $active_runners"
-echo "  Failed runners: $failed_runners"
-
-if [ $failed_runners -eq 0 ]; then
-    echo "✅ All runners are healthy!"
-    exit 0
-else
-    echo "⚠️  Some runners need attention!"
-    exit 1
-fi
-EOF
-
-chmod +x ~/action-runners/health_check.sh
+chmod +x manage_all.sh
 ```
 
-#### Service Installation Helper (`install_services.sh`)
+This script manages ALL GitHub runners on the system across all repositories.
+
+#### Repository Listing Script
 
 ```bash
-cat > ~/action-runners/install_services.sh << 'EOF'
-#!/bin/bash
-
-if [ "$#" -lt 1 ]; then
-    echo "Usage: $0 <repo-name>"
-    echo "Example: $0 viaduct"
-    exit 1
-fi
-
-REPO_NAME=$1
-
-echo "Installing services for repository: $REPO_NAME"
-
-cd ~/action-runners/$REPO_NAME
-
-for runner_dir in */; do
-    if [ -d "$runner_dir" ] && [ -f "$runner_dir/svc.sh" ]; then
-        runner_num=${runner_dir%/}
-        echo "Installing service for runner $runner_num..."
-
-        cd "$runner_dir"
-        sudo ./svc.sh install
-        sudo ./svc.sh start
-        cd ..
-
-        echo "✅ Runner $runner_num installed and started as service"
-    fi
-done
-
-echo "All services installed for repository: $REPO_NAME"
-EOF
-
-chmod +x ~/action-runners/install_services.sh
+chmod +x list_repos.sh
 ```
+
+This script shows all repositories and their runner status.
+
+#### Health Check Script
+
+```bash
+chmod +x health_check.sh
+```
+
+This script performs health checks on all runners and reports their status.
 
 ## Usage Guide
 
@@ -509,9 +127,6 @@ cd ~/action-runners
 
 # With custom number of runners (e.g., 6 runners)
 ./setup_runners.sh myorg/api-service 6
-
-# Set up 2 runners for a different repo
-./setup_runners.sh company/frontend-app 2
 ```
 
 #### 3. Directory Structure After Setup
@@ -519,24 +134,22 @@ cd ~/action-runners
 ```
 ~/action-runners/
 ├── setup_runners.sh
+├── setup_build_environment.sh
+├── setup_rust_environment.sh
 ├── manage_repo.sh
 ├── manage_all.sh
 ├── list_repos.sh
 ├── health_check.sh
-├── install_services.sh
 ├── viaduct/
 │   ├── 1/
 │   ├── 2/
 │   ├── 3/
 │   └── 4/
-├── api-service/
-│   ├── 1/
-│   ├── 2/
-│   ├── 3/
-│   └── 4/
-└── frontend-app/
+└── api-service/
     ├── 1/
-    └── 2/
+    ├── 2/
+    ├── 3/
+    └── 4/
 ```
 
 ### Managing Your Runners
@@ -545,26 +158,6 @@ cd ~/action-runners
 
 ```bash
 ./list_repos.sh
-```
-
-**Example output:**
-```
-GitHub Runner Repositories and Services:
-========================================
-
-Repository: viaduct
-Runners:
-  - Runner 1 (actions.runner.IgraLabs-viaduct.viaduct-runner-1.service): active
-  - Runner 2 (actions.runner.IgraLabs-viaduct.viaduct-runner-2.service): active
-  - Runner 3 (actions.runner.IgraLabs-viaduct.viaduct-runner-3.service): active
-  - Runner 4 (actions.runner.IgraLabs-viaduct.viaduct-runner-4.service): active
-  Total runners: 4
-
-Repository: api-service
-Runners:
-  - Runner 1 (actions.runner.MyOrg-api-service.api-service-runner-1.service): active
-  - Runner 2 (actions.runner.MyOrg-api-service.api-service-runner-2.service): active
-  Total runners: 2
 ```
 
 #### Repository-Specific Management
@@ -579,20 +172,17 @@ Runners:
 # Start all runners for 'viaduct' repository
 ./manage_repo.sh viaduct start
 
-# Restart all runners for 'viaduct' repository
-./manage_repo.sh viaduct restart
-
-# View live logs for 'viaduct' runners (Ctrl+C to exit)
+# View live logs for 'viaduct' runners
 ./manage_repo.sh viaduct logs
 
-# Debug service discovery for 'viaduct'
+# Debug service discovery
 ./manage_repo.sh viaduct debug
 ```
 
-#### Global Management (All Repositories)
+#### Global Management
 
 ```bash
-# Check status of ALL runners across all repositories
+# Check status of ALL runners
 ./manage_all.sh status
 
 # Stop ALL runners
@@ -601,138 +191,272 @@ Runners:
 # Start ALL runners
 ./manage_all.sh start
 
-# Restart ALL runners
-./manage_all.sh restart
-
 # View live logs from ALL runners
 ./manage_all.sh logs
-
-# List all repositories (same as ./list_repos.sh)
-./manage_all.sh list
 ```
 
-#### Health Monitoring
+## Workflow Configuration
 
-```bash
-# Run health check
-./health_check.sh
-
-# Set up automated health checks (run every 5 minutes)
-crontab -e
-# Add this line:
-*/5 * * * * /home/$(whoami)/action-runners/health_check.sh >> /var/log/runner-health.log 2>&1
-```
-
-#### Install Runners as Services (If Not Done During Setup)
-
-```bash
-# Install all runners for a repository as services
-./install_services.sh viaduct
-```
-
-## Using Runners in Your Workflows
-
-### Basic Usage
-
-Add this to your `.github/workflows/*.yml` files:
+### Enhanced Rust Workflow Template
 
 ```yaml
+name: Format, Lint & Typos
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
 jobs:
-  build:
-    runs-on: self-hosted
+  format-lint-typos:
+    runs-on: [self-hosted, viaduct]  # Use your repository label
     steps:
-      - uses: actions/checkout@v4
-      - name: Build application
-        run: make build
-```
-
-### Targeting Specific Repository Runners
-
-```yaml
-jobs:
-  test:
-    runs-on: [self-hosted, viaduct]  # Only use runners with 'viaduct' label
-    steps:
-      - uses: actions/checkout@v4
-      - name: Run tests
-        run: npm test
-```
-
-### Parallel Jobs Example
-
-```yaml
-jobs:
-  test:
-    strategy:
-      matrix:
-        shard: [1, 2, 3, 4]
-    runs-on: self-hosted
-    steps:
-      - uses: actions/checkout@v4
-      - name: Run test shard ${{ matrix.shard }}
-        run: npm test -- --shard=${{ matrix.shard }}
-```
-
-### Resource Optimization in Workflows
-
-```yaml
-jobs:
-  build:
-    runs-on: self-hosted
-    steps:
-      - name: Configure maximum resource usage
+      - name: Setup Rust environment
         run: |
-          # CPU cores detection
-          if [ "$(uname)" == "Darwin" ]; then
-            CORES=$(sysctl -n hw.ncpu)
-          elif [ "$(expr substr $(uname -s) 1 5)" == "Linux" ]; then
-            CORES=$(nproc)
-          else
-            CORES=4  # Default fallback
-          fi
+          # Source Rust environment
+          source ~/.cargo/env
 
-          # Set environment variables for this job
-          echo "CORES=$CORES" >> $GITHUB_ENV
-          echo "MAKEFLAGS=-j$CORES" >> $GITHUB_ENV
-          echo "GRADLE_OPTS=-Dorg.gradle.parallel=true -Dorg.gradle.workers.max=$CORES" >> $GITHUB_ENV
+          # Add to GitHub Actions PATH for all subsequent steps
+          echo "$HOME/.cargo/bin" >> $GITHUB_PATH
+
+          # Set environment variables
+          echo "CARGO_HOME=$HOME/.cargo" >> $GITHUB_ENV
+          echo "RUSTUP_HOME=$HOME/.rustup" >> $GITHUB_ENV
+
+          # Verify Rust is working
+          echo "=== Rust Environment ==="
+          echo "rustup: $(rustup --version)"
+          echo "rustc: $(rustc --version)"
+          echo "cargo: $(cargo --version)"
+          echo "========================"
 
       - uses: actions/checkout@v4
-      - name: Build with all cores
-        run: make build  # Will use MAKEFLAGS automatically
+
+      - name: Cache cargo dependencies
+        uses: actions/cache@v3
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Check formatting
+        run: cargo fmt -- --check
+
+      - name: Run clippy
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+      - name: Install and run typos
+        run: |
+          if ! command -v typos &> /dev/null; then
+            cargo install typos-cli
+          fi
+          typos
+```
+
+### Build and Test Workflow
+
+```yaml
+name: Build and Test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  build-and-test:
+    runs-on: [self-hosted, viaduct]
+    steps:
+      - name: Setup Rust environment
+        run: |
+          source ~/.cargo/env
+          echo "$HOME/.cargo/bin" >> $GITHUB_PATH
+          echo "CARGO_HOME=$HOME/.cargo" >> $GITHUB_ENV
+          echo "RUSTUP_HOME=$HOME/.rustup" >> $GITHUB_ENV
+
+      - uses: actions/checkout@v4
+
+      - name: Cache cargo dependencies
+        uses: actions/cache@v3
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Build
+        run: |
+          # Use all available cores for faster builds
+          export CARGO_BUILD_JOBS=$(nproc)
+          cargo build --release --verbose
+
+      - name: Run tests
+        run: |
+          # Run tests with all available cores
+          export CARGO_TEST_THREADS=$(nproc)
+          cargo test --release --verbose
+```
+
+### Dependency Audit Workflow
+
+```yaml
+name: Dependency security audit
+
+on:
+  push:
+    paths:
+      - "**/Cargo.toml"
+      - "**/Cargo.lock"
+  schedule:
+    - cron: '0 2 * * 1'  # Weekly on Monday at 2 AM (new vulnerabilities)
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  security_audit:
+    timeout-minutes: 10
+    runs-on: [self-hosted, viaduct]  # Add specific labels
+    permissions:
+      contents: read
+      checks: write
+    steps:
+      - name: Setup Rust environment  # Add this step
+        run: |
+          source ~/.cargo/env
+          echo "$HOME/.cargo/bin" >> $GITHUB_PATH
+
+      - name: Check out
+        uses: actions/checkout@v4
+
+      - name: Cache audit-check build
+        id: cache-audit-check
+        uses: actions/cache@v4
+        continue-on-error: false
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+
+      - name: Run audit-check action
+        run: |
+          which cargo-deny || cargo install cargo-deny
+          cargo deny check
+```
+
+### UB Detection Workflow
+
+```yaml
+name: Undefined Behavior Detection
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  miri:
+    runs-on: [self-hosted, viaduct]
+    steps:
+      - name: Setup Rust nightly environment
+        run: |
+          source ~/.cargo/env
+          echo "$HOME/.cargo/bin" >> $GITHUB_PATH
+
+          # Ensure nightly and miri are available
+          rustup toolchain install nightly
+          rustup component add miri --toolchain nightly
+
+      - uses: actions/checkout@v4
+
+      - name: Run Miri
+        run: cargo +nightly miri test
 ```
 
 ## Troubleshooting
 
-### Common Issues
+### Common Issues and Solutions
 
-#### Runners Not Appearing in GitHub
-- **Check token validity:** Tokens expire after 1 hour
-- **Verify repository URL:** Ensure correct organization/repository format
-- **Check network connectivity:** Runners need internet access
+#### 1. "linker 'cc' not found" Error
 
-#### Services Not Found
+**Problem:** Missing C compiler and build tools.
+
+**Solution:**
 ```bash
-# Debug service discovery
-./manage_repo.sh viaduct debug
-
-# Check if services exist
-sudo systemctl list-units --type=service | grep actions.runner
-```
-
-#### Permission Denied Errors
-```bash
-# Fix permissions
-sudo chown -R $USER:$USER ~/action-runners
-chmod +x ~/action-runners/*.sh
-```
-
-#### Runners Offline After Reboot
-```bash
-# Restart all services
+sudo apt update
+sudo apt install -y build-essential pkg-config libssl-dev
+cd ~/action-runners
 ./manage_all.sh restart
+```
 
-# Or restart specific repository
-./manage_repo.sh viaduct restart
+#### 2. "cargo-fmt is not installed" Error
+
+**Problem:** Rust components missing or broken installation.
+
+**Solution:**
+```bash
+# Check Rust installation
+ls -la ~/.cargo/bin/
+
+# If symlinks are broken (pointing to missing rustup):
+rm -rf ~/.cargo ~/.rustup
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+source ~/.cargo/env
+rustup component add rustfmt clippy
+```
+
+#### 3. Broken Rust Symlinks
+
+**Problem:** All tools in `~/.cargo/bin/` are symlinks pointing to missing `rustup`.
+
+**Diagnosis:**
+```bash
+ls -la ~/.cargo/bin/
+# Shows: cargo -> rustup, rustc -> rustup, etc.
+which rustup
+# Shows: rustup not found
+```
+
+**Solution:**
+```bash
+# Complete reinstallation
+rm -rf ~/.cargo ~/.rustup
+./setup_rust_environment.sh
+```
+
+#### 4. Runners Not Found by Management Scripts
+
+**Problem:** Service names don't match expected patterns.
+
+**Solution:**
+```bash
+# Debug service names
+sudo systemctl list-units --type=service | grep actions.runner
+
+# Use the debug function
+./manage_repo.sh viaduct debug
+```
+
+#### 5. Environment Not Persisting in Workflows
+
+**Problem:** Rust commands work in shell but not in GitHub Actions.
+
+**Solution:** Always add this to your workflow steps:
+```yaml
+- name: Setup Rust environment
+  run: |
+    source ~/.cargo/env
+    echo "$HOME/.cargo/bin" >> $GITHUB_PATH
 ```
 
 ### Log Analysis
@@ -745,23 +469,33 @@ chmod +x ~/action-runners/*.sh
 # All runners logs
 ./manage_all.sh logs
 
-# Historical logs for a specific service
-sudo journalctl -u actions.runner.IgraLabs-viaduct.viaduct-runner-1 --since "1 hour ago"
+# Historical logs
+sudo journalctl -u actions.runner.* --since "1 hour ago"
 ```
 
 #### Log Cleanup
 ```bash
-# Clean old logs (older than 2 weeks)
+# Clean old logs
 sudo journalctl --vacuum-time=2weeks
-
-# Limit log size (keep only 1GB)
 sudo journalctl --vacuum-size=1G
 ```
 
-### Update Runners
+### Health Monitoring
 
+#### Manual Health Check
 ```bash
-# Create update script for all repositories
+./health_check.sh
+```
+
+#### Automated Health Monitoring
+```bash
+# Set up cron job for health checks
+crontab -e
+# Add: */5 * * * * /home/$(whoami)/action-runners/health_check.sh >> /var/log/runner-health.log 2>&1
+```
+
+### Update All Runners
+```bash
 cat > ~/action-runners/update_all.sh << 'EOF'
 #!/bin/bash
 cd ~/action-runners
@@ -784,12 +518,9 @@ done
 EOF
 
 chmod +x ~/action-runners/update_all.sh
-
-# Run the update
-./update_all.sh
 ```
 
-## Performance and Cost Optimization
+## Performance Optimization
 
 ### Hardware Recommendations
 
@@ -806,10 +537,11 @@ With self-hosted runners, you'll save on:
 - ✅ GitHub Actions minutes (no per-minute billing)
 - ✅ Build queue times (dedicated resources)
 - ✅ Data transfer costs (local artifact storage)
+- ✅ Custom hardware optimization
 
 Expected savings: **60-80%** reduction in CI/CD costs for most projects.
 
-### Monitoring Resource Usage
+### Resource Optimization
 
 ```bash
 # Monitor system resources
@@ -818,6 +550,10 @@ df -h ~/action-runners/
 
 # Check runner-specific resource usage
 ps aux | grep Runner.Listener
+
+# Optimize concurrent job processing
+# Edit .runner.jitconfig in each runner directory:
+echo '{"workJobConcurrency":"4"}' > ~/.../runner/.runner.jitconfig
 ```
 
 This comprehensive setup gives you full control over your GitHub Actions infrastructure while significantly reducing costs and improving performance.
