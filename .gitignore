@@ -1,0 +1,5 @@
+# Ignore all folders
+*/
+
+# Exception: Keep doc folder tracked
+!doc/
