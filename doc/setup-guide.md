@@ -41,16 +41,43 @@ chmod +x setup_runners.sh
 
 This script handles the complete setup of multiple GitHub self-hosted runners, including downloading, configuring, and optionally installing them as system services.
 
-### 3. Set Up Build Environment
+### 3. Set Up Complete Build Environment
 
-Run the build environment setup script:
+Run the comprehensive build environment setup script:
 
 ```bash
 chmod +x setup_build_environment.sh
 ./setup_build_environment.sh
 ```
 
-This script installs essential build tools including `build-essential`, `pkg-config`, `libssl-dev`, and other dependencies required for compiling Rust projects.
+This single script handles everything needed for CI stability:
+
+**System Build Tools:**
+- Essential build tools (`build-essential`, `pkg-config`, `libssl-dev`)
+- LLVM/Clang development libraries (`libclang-dev`, `llvm-dev`)
+- System development libraries (`libudev-dev`)
+- Git, curl, and other dependencies
+
+**Comprehensive Rust Environment:**
+- Stable Rust toolchain (set as default to prevent version mismatches)
+- Nightly Rust toolchain (for miri and advanced tools)
+- Essential components (rustfmt, clippy) for both toolchains
+- Common cargo tools (`cargo-audit`, `typos-cli`)
+
+**CI Stability Features:**
+- Prevents concurrent installation conflicts
+- Eliminates global state pollution issues
+- Configures proper GitHub Actions environment
+- Sets up cargo config for reliable builds
+- Configures system dependencies (LIBCLANG_PATH, etc.)
+- Addresses all common CI/local environment mismatches
+
+⚠️ **Important:** This script addresses critical CI issues including:
+- Rust version mismatches between local and CI
+- Concurrent installation conflicts in parallel jobs
+- Global state pollution from mixed toolchains
+- Build artifact corruption from shared target directories
+- Missing system dependencies for bindgen-based crates
 
 ### 4. Set Up Rust Environment
 
