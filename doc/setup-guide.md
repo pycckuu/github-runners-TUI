@@ -603,5 +603,113 @@ ps aux | grep Runner.Listener
 echo '{"workJobConcurrency":"4"}' > ~/.../runner/.runner.jitconfig
 ```
 
+## Removing Runners
+
+This setup includes runner removal that handles both systemd services and GitHub registration. The removal process varies depending on whether `sudo ./svc.sh stop` works or not.
+
+### Method 1: Create a Removal Script (Recommended)
+
+Create a `remove_runner.sh` script in your `~/action-runners` directory:
+
+```bash
+# Create the removal script (copy the script content above)
+chmod +x remove_runner.sh
+
+# Remove a specific runner
+./remove_runner.sh viaduct 2
+
+# Remove all runners for a repository
+./remove_runner.sh viaduct all
+```
+
+### Method 2: Manual Removal (When svc.sh fails)
+
+If `sudo ./svc.sh stop` doesn't work, use this systematic approach:
+
+#### Step 1: Stop Using systemctl Directly
+
+```bash
+# Find the service name for your runner
+sudo systemctl list-units --all --type=service | grep "actions.runner.*viaduct-runner-2"
+
+# Stop the service directly (replace with actual service name)
+sudo systemctl stop actions.runner.username.viaduct-runner-2.service
+sudo systemctl disable actions.runner.username.viaduct-runner-2.service
+```
+
+#### Step 2: Remove from GitHub
+
+```bash
+cd ~/action-runners/viaduct/2
+./config.sh remove
+# You'll be prompted for a removal token from GitHub
+```
+
+#### Step 3: Clean Up Service Files
+
+```bash
+# Remove systemd service file if it exists
+sudo rm -f /etc/systemd/system/actions.runner.*.viaduct-runner-2.service
+sudo systemctl daemon-reload
+```
+
+#### Step 4: Remove Directory
+
+```bash
+cd ~/action-runners
+rm -rf viaduct/2
+```
+
+### Method 3: Using Existing Management Scripts
+
+You can also use the existing management infrastructure:
+
+```bash
+# Stop the runner first
+./manage_repo.sh viaduct stop
+
+# Then follow steps 2-4 from Method 2 for each runner you want to remove
+```
+
+### Troubleshooting Removal Issues
+
+#### If `svc.sh stop` fails:
+```bash
+# Check if the runner was installed as a service
+./manage_repo.sh viaduct debug
+
+# Use systemctl directly
+sudo systemctl stop $(sudo systemctl list-units --all | grep "viaduct-runner-2" | awk '{print $1}')
+```
+
+#### If GitHub removal fails:
+1. Go to your repository → Settings → Actions → Runners
+2. Find the runner and click "Remove runner"
+3. Use the removal token provided in the command shown
+
+#### If service files remain:
+```bash
+# Find and remove orphaned service files
+sudo find /etc/systemd/system -name "*viaduct-runner*" -delete
+sudo systemctl daemon-reload
+```
+
+### Verification
+
+After removal, verify the runner is completely gone:
+
+```bash
+# Check services
+./manage_repo.sh viaduct status
+
+# Check GitHub (should not show the removed runner)
+# Visit: Repository → Settings → Actions → Runners
+
+# Check directories
+ls ~/action-runners/viaduct/
+```
+
+The key insight is that your existing management scripts already use `systemctl` directly, which is more reliable than `svc.sh`. The removal script I provided follows the same patterns and handles the edge cases where `svc.sh` might not work.
+
 This comprehensive setup gives you full control over your GitHub Actions infrastructure while significantly reducing costs and improving performance.
 
