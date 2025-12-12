@@ -86,18 +86,14 @@ setup_runner() {
     # Set up concurrent job processing (optional)
     echo '{"workJobConcurrency":"2"}' > .runner.jitconfig
     
-    # Service installation only available on Linux (uses systemd)
-    if [ "$OS" = "linux" ]; then
-        echo "Do you want to install runner ${runner_number} as a service? (y/n)"
-        read -r install_service
+    # Install and start as service (works on both Linux/systemd and macOS/launchd)
+    echo "Do you want to install runner ${runner_number} as a service? (y/n)"
+    read -r install_service
 
-        if [[ "$install_service" == "y" || "$install_service" == "Y" ]]; then
-            sudo ./svc.sh install
-            sudo ./svc.sh start
-            echo "Runner ${runner_number} installed and started as a service."
-        else
-            echo "To start the runner manually, use: cd ${runner_dir} && ./run.sh"
-        fi
+    if [[ "$install_service" == "y" || "$install_service" == "Y" ]]; then
+        ./svc.sh install
+        ./svc.sh start
+        echo "Runner ${runner_number} installed and started as a service."
     else
         echo "To start the runner manually, use: cd ${runner_dir} && ./run.sh"
     fi
