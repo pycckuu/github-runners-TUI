@@ -105,7 +105,7 @@ pub fn discover_runners() -> Result<Vec<Runner>> {
                 username, &repo_name, runner_num
             );
 
-            let status = get_service_status(&service_name);
+            let status = get_service_status(&service_name, &runner_path);
 
             runners.push(Runner {
                 name: format!("runner-{}", runner_num),
@@ -124,8 +124,17 @@ pub fn discover_runners() -> Result<Vec<Runner>> {
     Ok(runners)
 }
 
-/// Get the status of a systemd service
-fn get_service_status(service_name: &str) -> RunnerStatus {
+/// Get the status of a runner service (cross-platform)
+fn get_service_status(service_name: &str, runner_path: &std::path::Path) -> RunnerStatus {
+    if cfg!(target_os = "macos") {
+        get_macos_service_status(service_name, runner_path)
+    } else {
+        get_linux_service_status(service_name)
+    }
+}
+
+/// Get service status on Linux using systemctl
+fn get_linux_service_status(service_name: &str) -> RunnerStatus {
     let output = Command::new("systemctl")
         .args(["is-active", service_name])
         .output();
@@ -144,17 +153,85 @@ fn get_service_status(service_name: &str) -> RunnerStatus {
     }
 }
 
+/// Get service status on macOS using launchctl or process check
+fn get_macos_service_status(service_name: &str, runner_path: &std::path::Path) -> RunnerStatus {
+    // First try launchctl
+    let output = Command::new("launchctl")
+        .args(["list", service_name])
+        .output();
+
+    if let Ok(output) = output {
+        if output.status.success() {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            // launchctl list <service> returns info if service exists
+            // Check if PID is present (first column, non-hyphen means running)
+            if let Some(first_line) = stdout.lines().next() {
+                let parts: Vec<&str> = first_line.split_whitespace().collect();
+                if let Some(pid) = parts.first() {
+                    if *pid != "-" && pid.parse::<u32>().is_ok() {
+                        return RunnerStatus::Active;
+                    } else if *pid == "-" {
+                        return RunnerStatus::Inactive;
+                    }
+                }
+            }
+            return RunnerStatus::Inactive;
+        }
+    }
+
+    // Fallback: check if Runner.Worker or Runner.Listener process is running for this path
+    if is_runner_process_running(runner_path) {
+        return RunnerStatus::Active;
+    }
+
+    // Check if .runner file exists (indicates configured but not running)
+    if runner_path.join(".runner").exists() {
+        return RunnerStatus::Inactive;
+    }
+
+    RunnerStatus::NotFound
+}
+
+/// Check if a runner process is running by looking for Runner.Worker/Listener
+fn is_runner_process_running(runner_path: &std::path::Path) -> bool {
+    let path_str = runner_path.to_string_lossy();
+
+    // Use pgrep to find runner processes
+    let output = Command::new("pgrep")
+        .args(["-f", &format!("Runner.Worker.*{}", path_str)])
+        .output();
+
+    if let Ok(output) = output {
+        if output.status.success() && !output.stdout.is_empty() {
+            return true;
+        }
+    }
+
+    // Also check for Runner.Listener
+    let output = Command::new("pgrep")
+        .args(["-f", &format!("Runner.Listener.*{}", path_str)])
+        .output();
+
+    if let Ok(output) = output {
+        if output.status.success() && !output.stdout.is_empty() {
+            return true;
+        }
+    }
+
+    false
+}
+
 /// Refresh the status of all runners
 pub fn refresh_runners(runners: &mut [Runner]) {
     for runner in runners.iter_mut() {
-        runner.status = get_service_status(&runner.service_name);
+        runner.status = get_service_status(&runner.service_name, &runner.path);
     }
 }
 
-/// Allowed systemctl actions for runner control
+/// Allowed actions for runner control
 const ALLOWED_ACTIONS: &[&str] = &["start", "stop", "restart"];
 
-/// Control a runner service with input validation
+/// Control a runner service with input validation (cross-platform)
 pub fn control_runner(runner: &Runner, action: &str) -> Result<String> {
     // Validate action is allowed
     if !ALLOWED_ACTIONS.contains(&action) {
@@ -177,6 +254,15 @@ pub fn control_runner(runner: &Runner, action: &str) -> Result<String> {
         ));
     }
 
+    if cfg!(target_os = "macos") {
+        control_runner_macos(runner, action)
+    } else {
+        control_runner_linux(runner, action)
+    }
+}
+
+/// Control runner on Linux using systemctl
+fn control_runner_linux(runner: &Runner, action: &str) -> Result<String> {
     let output = Command::new("sudo")
         .args(["systemctl", action, &runner.service_name])
         .output()?;
@@ -198,8 +284,163 @@ pub fn control_runner(runner: &Runner, action: &str) -> Result<String> {
     }
 }
 
-/// Get recent logs for a runner
+/// Control runner on macOS using launchctl or direct script
+fn control_runner_macos(runner: &Runner, action: &str) -> Result<String> {
+    let plist_path = format!("~/Library/LaunchAgents/{}.plist", runner.service_name);
+    let expanded_plist = shellexpand::tilde(&plist_path);
+
+    // Check if launchctl service exists
+    let has_launchctl = std::path::Path::new(expanded_plist.as_ref()).exists();
+
+    if has_launchctl {
+        // Use launchctl
+        let launchctl_action = match action {
+            "start" => "load",
+            "stop" => "unload",
+            "restart" => "kickstart",
+            _ => return Err(anyhow::anyhow!("Invalid action")),
+        };
+
+        let output = if action == "restart" {
+            Command::new("launchctl")
+                .args([
+                    "kickstart",
+                    "-k",
+                    &format!("gui/{}/{}", get_uid(), runner.service_name),
+                ])
+                .output()?
+        } else {
+            Command::new("launchctl")
+                .args([launchctl_action, expanded_plist.as_ref()])
+                .output()?
+        };
+
+        if output.status.success() {
+            Ok(format!(
+                "Successfully {}ed {}",
+                action,
+                runner.display_name()
+            ))
+        } else {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            Err(anyhow::anyhow!(
+                "Failed to {} {}: {}",
+                action,
+                runner.display_name(),
+                stderr
+            ))
+        }
+    } else {
+        // Fallback: use svc.sh script in runner directory
+        let svc_script = runner.path.join("svc.sh");
+        if svc_script.exists() {
+            // For start action, ensure service is installed first
+            if action == "start" {
+                // Check if service is installed by running status
+                let status_output = Command::new(&svc_script)
+                    .arg("status")
+                    .current_dir(&runner.path)
+                    .output();
+
+                let needs_install = match status_output {
+                    Ok(output) => {
+                        let stdout = String::from_utf8_lossy(&output.stdout);
+                        let stderr = String::from_utf8_lossy(&output.stderr);
+                        stdout.contains("not installed") || stderr.contains("not installed")
+                    }
+                    Err(_) => true,
+                };
+
+                if needs_install {
+                    let install_output = Command::new(&svc_script)
+                        .arg("install")
+                        .current_dir(&runner.path)
+                        .output()?;
+
+                    if !install_output.status.success() {
+                        let stderr = String::from_utf8_lossy(&install_output.stderr);
+                        return Err(anyhow::anyhow!(
+                            "Failed to install service for {}: {}",
+                            runner.display_name(),
+                            stderr
+                        ));
+                    }
+                }
+            }
+
+            let output = Command::new(&svc_script)
+                .arg(action)
+                .current_dir(&runner.path)
+                .output()?;
+
+            if output.status.success() {
+                Ok(format!(
+                    "Successfully {}ed {}",
+                    action,
+                    runner.display_name()
+                ))
+            } else {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                Err(anyhow::anyhow!(
+                    "Failed to {} {}: {}",
+                    action,
+                    runner.display_name(),
+                    stderr
+                ))
+            }
+        } else {
+            // Direct run.sh control
+            match action {
+                "start" => {
+                    Command::new("nohup")
+                        .args([runner.path.join("run.sh").to_str().unwrap()])
+                        .current_dir(&runner.path)
+                        .spawn()?;
+                    Ok(format!("Started {}", runner.display_name()))
+                }
+                "stop" => {
+                    // Kill runner processes
+                    let path_str = runner.path.to_string_lossy();
+                    Command::new("pkill")
+                        .args(["-f", &format!("Runner.*{}", path_str)])
+                        .output()?;
+                    Ok(format!("Stopped {}", runner.display_name()))
+                }
+                "restart" => {
+                    // Stop then start
+                    let path_str = runner.path.to_string_lossy();
+                    let _ = Command::new("pkill")
+                        .args(["-f", &format!("Runner.*{}", path_str)])
+                        .output();
+                    std::thread::sleep(std::time::Duration::from_secs(1));
+                    Command::new("nohup")
+                        .args([runner.path.join("run.sh").to_str().unwrap()])
+                        .current_dir(&runner.path)
+                        .spawn()?;
+                    Ok(format!("Restarted {}", runner.display_name()))
+                }
+                _ => Err(anyhow::anyhow!("Invalid action")),
+            }
+        }
+    }
+}
+
+/// Get current user ID (for launchctl)
+fn get_uid() -> u32 {
+    unsafe { libc::getuid() }
+}
+
+/// Get recent logs for a runner (cross-platform)
 pub fn get_runner_logs(runner: &Runner, lines: usize) -> Result<Vec<String>> {
+    if cfg!(target_os = "macos") {
+        get_runner_logs_macos(runner, lines)
+    } else {
+        get_runner_logs_linux(runner, lines)
+    }
+}
+
+/// Get logs on Linux using journalctl
+fn get_runner_logs_linux(runner: &Runner, lines: usize) -> Result<Vec<String>> {
     let output = Command::new("journalctl")
         .args([
             "-u",
@@ -214,4 +455,46 @@ pub fn get_runner_logs(runner: &Runner, lines: usize) -> Result<Vec<String>> {
 
     let logs = String::from_utf8_lossy(&output.stdout);
     Ok(logs.lines().map(|s| s.to_string()).collect())
+}
+
+/// Get logs on macOS from _diag directory
+fn get_runner_logs_macos(runner: &Runner, lines: usize) -> Result<Vec<String>> {
+    let diag_dir = runner.path.join("_diag");
+
+    if !diag_dir.exists() {
+        return Ok(vec!["No logs found (no _diag directory)".to_string()]);
+    }
+
+    // Find the most recent Worker log file
+    let mut log_files: Vec<_> = std::fs::read_dir(&diag_dir)?
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_name().to_string_lossy().starts_with("Worker_"))
+        .collect();
+
+    log_files.sort_by_key(|e| std::cmp::Reverse(e.metadata().ok().and_then(|m| m.modified().ok())));
+
+    if let Some(latest_log) = log_files.first() {
+        let content = std::fs::read_to_string(latest_log.path())?;
+        let all_lines: Vec<String> = content.lines().map(|s| s.to_string()).collect();
+        let start = all_lines.len().saturating_sub(lines);
+        Ok(all_lines[start..].to_vec())
+    } else {
+        // Try Runner log if no Worker log
+        let mut runner_logs: Vec<_> = std::fs::read_dir(&diag_dir)?
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().starts_with("Runner_"))
+            .collect();
+
+        runner_logs
+            .sort_by_key(|e| std::cmp::Reverse(e.metadata().ok().and_then(|m| m.modified().ok())));
+
+        if let Some(latest_log) = runner_logs.first() {
+            let content = std::fs::read_to_string(latest_log.path())?;
+            let all_lines: Vec<String> = content.lines().map(|s| s.to_string()).collect();
+            let start = all_lines.len().saturating_sub(lines);
+            Ok(all_lines[start..].to_vec())
+        } else {
+            Ok(vec!["No log files found in _diag".to_string()])
+        }
+    }
 }
