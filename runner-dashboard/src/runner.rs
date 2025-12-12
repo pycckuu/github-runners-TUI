@@ -1,6 +1,23 @@
-use anyhow::Result;
-use std::path::PathBuf;
+use anyhow::{Context, Result};
+use std::path::{Path, PathBuf};
 use std::process::Command;
+
+/// Validate that a path doesn't contain shell metacharacters that could enable command injection
+fn validate_path(path: &Path) -> Result<()> {
+    let path_str = path.to_string_lossy();
+    if path_str.contains(';')
+        || path_str.contains('&')
+        || path_str.contains('|')
+        || path_str.contains('`')
+        || path_str.contains('$')
+        || path_str.contains('\n')
+    {
+        return Err(anyhow::anyhow!(
+            "Invalid path: contains shell metacharacters"
+        ));
+    }
+    Ok(())
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum RunnerStatus {
@@ -230,9 +247,7 @@ fn is_runner_process_running(runner_path: &std::path::Path) -> bool {
     ];
 
     for pattern in &patterns {
-        let output = Command::new("pgrep")
-            .args(["-f", pattern])
-            .output();
+        let output = Command::new("pgrep").args(["-f", pattern]).output();
 
         if let Ok(output) = output {
             if output.status.success() && !output.stdout.is_empty() {
@@ -413,12 +428,23 @@ fn control_runner_macos(runner: &Runner, action: &str) -> Result<String> {
             }
         } else {
             // Direct run.sh control
+            // Validate path before using in commands
+            validate_path(&runner.path)?;
+
+            let run_script = runner.path.join("run.sh");
+            let run_script_str = run_script
+                .to_str()
+                .ok_or_else(|| anyhow::anyhow!("Invalid UTF-8 in path: {:?}", run_script))?;
+
             match action {
                 "start" => {
                     Command::new("nohup")
-                        .args([runner.path.join("run.sh").to_str().unwrap()])
+                        .arg(run_script_str)
                         .current_dir(&runner.path)
-                        .spawn()?;
+                        .spawn()
+                        .with_context(|| {
+                            format!("Failed to start runner {}", runner.display_name())
+                        })?;
                     Ok(format!("Started {}", runner.display_name()))
                 }
                 "stop" => {
@@ -426,30 +452,58 @@ fn control_runner_macos(runner: &Runner, action: &str) -> Result<String> {
                     let path_str = runner.path.to_string_lossy();
                     Command::new("pkill")
                         .args(["-f", &format!("Runner.*{}", path_str)])
-                        .output()?;
+                        .output()
+                        .with_context(|| {
+                            format!("Failed to stop runner {}", runner.display_name())
+                        })?;
                     Ok(format!("Stopped {}", runner.display_name()))
                 }
                 "restart" => {
-                    // Stop then start
+                    // Stop then wait for process termination
                     let path_str = runner.path.to_string_lossy();
                     let _ = Command::new("pkill")
                         .args(["-f", &format!("Runner.*{}", path_str)])
                         .output();
-                    std::thread::sleep(std::time::Duration::from_secs(1));
+
+                    // Poll for process termination (up to 5 seconds)
+                    let timeout = std::time::Duration::from_secs(5);
+                    let start = std::time::Instant::now();
+                    while is_runner_process_running(&runner.path) {
+                        if start.elapsed() > timeout {
+                            return Err(anyhow::anyhow!(
+                                "Timeout waiting for runner {} to stop",
+                                runner.display_name()
+                            ));
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(100));
+                    }
+
                     Command::new("nohup")
-                        .args([runner.path.join("run.sh").to_str().unwrap()])
+                        .arg(run_script_str)
                         .current_dir(&runner.path)
-                        .spawn()?;
+                        .spawn()
+                        .with_context(|| {
+                            format!("Failed to restart runner {}", runner.display_name())
+                        })?;
                     Ok(format!("Restarted {}", runner.display_name()))
                 }
-                _ => Err(anyhow::anyhow!("Invalid action")),
+                _ => Err(anyhow::anyhow!("Invalid action: {}", action)),
             }
         }
     }
 }
 
-/// Get current user ID (for launchctl)
+/// Get current user ID for launchctl service domain.
+///
+/// # Safety
+/// This is safe because `libc::getuid()` is a simple read-only system call that:
+/// - Always succeeds (no error conditions)
+/// - Has no side effects
+/// - Only reads process state
+/// - Returns a primitive value (u32)
 fn get_uid() -> u32 {
+    // SAFETY: libc::getuid() is always safe to call - it's a simple
+    // read-only syscall with no failure modes or preconditions
     unsafe { libc::getuid() }
 }
 
