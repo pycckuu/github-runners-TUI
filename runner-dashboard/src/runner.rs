@@ -155,7 +155,7 @@ fn get_linux_service_status(service_name: &str) -> RunnerStatus {
 
 /// Get service status on macOS using launchctl or process check
 fn get_macos_service_status(service_name: &str, runner_path: &std::path::Path) -> RunnerStatus {
-    // First try launchctl
+    // First try launchctl list with exact service name
     let output = Command::new("launchctl")
         .args(["list", service_name])
         .output();
@@ -179,6 +179,31 @@ fn get_macos_service_status(service_name: &str, runner_path: &std::path::Path) -
         }
     }
 
+    // Fallback: search launchctl list for partial match (service name might differ slightly)
+    let output = Command::new("launchctl").arg("list").output();
+    if let Ok(output) = output {
+        if output.status.success() {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            // Look for any line containing "actions.runner" and the repo name from path
+            let parent_dir = runner_path
+                .parent()
+                .and_then(|p| p.file_name())
+                .and_then(|n| n.to_str())
+                .unwrap_or("");
+
+            for line in stdout.lines() {
+                if line.contains("actions.runner") && line.contains(parent_dir) {
+                    let parts: Vec<&str> = line.split_whitespace().collect();
+                    if let Some(pid) = parts.first() {
+                        if *pid != "-" && pid.parse::<u32>().is_ok() {
+                            return RunnerStatus::Active;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     // Fallback: check if Runner.Worker or Runner.Listener process is running for this path
     if is_runner_process_running(runner_path) {
         return RunnerStatus::Active;
@@ -196,25 +221,23 @@ fn get_macos_service_status(service_name: &str, runner_path: &std::path::Path) -
 fn is_runner_process_running(runner_path: &std::path::Path) -> bool {
     let path_str = runner_path.to_string_lossy();
 
-    // Use pgrep to find runner processes
-    let output = Command::new("pgrep")
-        .args(["-f", &format!("Runner.Worker.*{}", path_str)])
-        .output();
+    // Patterns to search for (Runner.Worker, Runner.Listener, or just the path in any dotnet process)
+    let patterns = [
+        format!("Runner.Worker.*{}", path_str),
+        format!("Runner.Listener.*{}", path_str),
+        format!("dotnet.*{}", path_str),
+        path_str.to_string(), // Just the path - catches any process with this dir
+    ];
 
-    if let Ok(output) = output {
-        if output.status.success() && !output.stdout.is_empty() {
-            return true;
-        }
-    }
+    for pattern in &patterns {
+        let output = Command::new("pgrep")
+            .args(["-f", pattern])
+            .output();
 
-    // Also check for Runner.Listener
-    let output = Command::new("pgrep")
-        .args(["-f", &format!("Runner.Listener.*{}", path_str)])
-        .output();
-
-    if let Ok(output) = output {
-        if output.status.success() && !output.stdout.is_empty() {
-            return true;
+        if let Ok(output) = output {
+            if output.status.success() && !output.stdout.is_empty() {
+                return true;
+            }
         }
     }
 
