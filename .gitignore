@@ -1,2 +1,5 @@
 # Rust build artifacts
 runner-dashboard/target/
+
+# Local task files
+tasks/
