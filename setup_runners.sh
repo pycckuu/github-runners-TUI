@@ -15,9 +15,24 @@ NUM_RUNNERS=${2:-4}  # Use the second argument or default to 4 runners
 REPO_NAME=$(echo "$GITHUB_REPO" | cut -d'/' -f2)  # Extract repo name from org/repo
 REPO_URL="https://github.com/${GITHUB_REPO}"
 BASE_DIR="$HOME/action-runners/${REPO_NAME}"
-RUNNER_VERSION="2.314.1"  # Update this to the latest version if needed
-ARCHITECTURE="x64"  # Change to arm64 if needed
-OS="linux"          # Change to darwin for macOS or win for Windows
+RUNNER_VERSION="2.330.0"
+
+# Auto-detect OS (GitHub uses 'osx' for macOS)
+case "$(uname -s)" in
+    Linux*)  OS="linux";;
+    Darwin*) OS="osx";;
+    *)       echo "Unsupported OS: $(uname -s)"; exit 1;;
+esac
+
+# Auto-detect architecture
+case "$(uname -m)" in
+    x86_64)  ARCHITECTURE="x64";;
+    aarch64) ARCHITECTURE="arm64";;
+    arm64)   ARCHITECTURE="arm64";;
+    *)       echo "Unsupported architecture: $(uname -m)"; exit 1;;
+esac
+
+echo "Detected platform: ${OS}-${ARCHITECTURE}"
 
 echo "Setting up ${NUM_RUNNERS} runners for repository: ${GITHUB_REPO}"
 echo "Using base directory: ${BASE_DIR}"
@@ -37,15 +52,18 @@ setup_runner() {
     cd "${runner_dir}"
     
     # Download the runner if not already present
-    if [ ! -f "actions-runner-${OS}-${ARCHITECTURE}.tar.gz" ]; then
+    if [ ! -f "actions-runner-${OS}-${ARCHITECTURE}-${RUNNER_VERSION}.tar.gz" ]; then
         echo "Downloading runner package..."
-        curl -o "actions-runner-${OS}-${ARCHITECTURE}.tar.gz" -L "https://github.com/actions/runner/releases/download/v${RUNNER_VERSION}/actions-runner-${OS}-${ARCHITECTURE}-${RUNNER_VERSION}.tar.gz"
-    fi
-    
-    # Extract the runner if not already extracted
-    if [ ! -f "./config.sh" ]; then
+        # Remove old binaries to ensure clean extraction
+        rm -rf bin externals ./*.sh 2>/dev/null || true
+        curl -o "actions-runner-${OS}-${ARCHITECTURE}-${RUNNER_VERSION}.tar.gz" -L "https://github.com/actions/runner/releases/download/v${RUNNER_VERSION}/actions-runner-${OS}-${ARCHITECTURE}-${RUNNER_VERSION}.tar.gz"
         echo "Extracting runner package..."
-        tar xzf "./actions-runner-${OS}-${ARCHITECTURE}.tar.gz"
+        tar xzf "./actions-runner-${OS}-${ARCHITECTURE}-${RUNNER_VERSION}.tar.gz"
+    elif [ ! -f "./config.sh" ]; then
+        # Tarball exists but not extracted - clean before extraction
+        rm -rf bin externals ./*.sh 2>/dev/null || true
+        echo "Extracting runner package..."
+        tar xzf "./actions-runner-${OS}-${ARCHITECTURE}-${RUNNER_VERSION}.tar.gz"
     fi
     
     # Check for existing runner configuration
@@ -60,22 +78,26 @@ setup_runner() {
         read -r TOKEN
     fi
     
-    # Configure the runner
+    # Configure the runner (--replace allows re-registering existing runner names)
     echo "Configuring runner ${runner_number}..."
     ./config.sh --url "$REPO_URL" --token "$TOKEN" --name "$runner_name" \
-                --labels "self-hosted,linux,x64,${REPO_NAME}" --work "_work" --unattended
+                --labels "self-hosted,${OS},${ARCHITECTURE},${REPO_NAME}" --work "_work" --unattended --replace
     
     # Set up concurrent job processing (optional)
     echo '{"workJobConcurrency":"2"}' > .runner.jitconfig
     
-    # Install as a service if user wants to
-    echo "Do you want to install runner ${runner_number} as a service? (y/n)"
-    read -r install_service
-    
-    if [[ "$install_service" == "y" || "$install_service" == "Y" ]]; then
-        sudo ./svc.sh install
-        sudo ./svc.sh start
-        echo "Runner ${runner_number} installed and started as a service."
+    # Service installation only available on Linux (uses systemd)
+    if [ "$OS" = "linux" ]; then
+        echo "Do you want to install runner ${runner_number} as a service? (y/n)"
+        read -r install_service
+
+        if [[ "$install_service" == "y" || "$install_service" == "Y" ]]; then
+            sudo ./svc.sh install
+            sudo ./svc.sh start
+            echo "Runner ${runner_number} installed and started as a service."
+        else
+            echo "To start the runner manually, use: cd ${runner_dir} && ./run.sh"
+        fi
     else
         echo "To start the runner manually, use: cd ${runner_dir} && ./run.sh"
     fi
@@ -85,7 +107,7 @@ setup_runner() {
 echo "Setting up ${NUM_RUNNERS} GitHub runners for repository..."
 
 # Create directories if they don't exist
-for i in $(seq 1 $NUM_RUNNERS); do
+for i in $(seq 1 "$NUM_RUNNERS"); do
     mkdir -p "${BASE_DIR}/${i}"
 done
 
@@ -94,7 +116,7 @@ echo "Please enter your GitHub runner registration token:"
 read -r TOKEN
 
 # Set up each runner
-for i in $(seq 1 $NUM_RUNNERS); do
+for i in $(seq 1 "$NUM_RUNNERS"); do
     setup_runner "$i"
 done
 

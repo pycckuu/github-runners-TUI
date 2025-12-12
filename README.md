@@ -1,4 +1,4 @@
-# GitHub Self-Hosted Runners for Igra Labs
+# GitHub Self-Hosted Runners
 
 Reduce GitHub Actions costs by **60-80%** with automated self-hosted runner setup and management.
 
@@ -23,15 +23,19 @@ chmod +x *.sh
 - **🏗️ Build Environment**: Complete Rust, C/C++, and system tools setup
 - **📦 Multiple Repositories**: Manage runners across different repos
 - **🔧 Easy Management**: Simple commands for start/stop/restart/logs
-- **⚙️ Auto-Service Installation**: Runs as systemd services with health monitoring
+- **⚙️ Auto-Service Installation**: Runs as systemd services (Linux) with health monitoring
 - **🚀 CI Stability**: Prevents common CI issues and environment mismatches
 
 ## 📋 Requirements
 
-- Linux machine with 4+ GB RAM, 50+ GB storage
+- Linux or macOS machine with 4+ GB RAM, 50+ GB storage
 - `sudo` access and internet connection
 - GitHub repository admin access
-- Standard Linux utilities (`curl`, `tar`, `systemctl`, etc.)
+- Standard utilities (`curl`, `tar`)
+
+**Supported Platforms:**
+- Linux x64, Linux ARM64
+- macOS x64 (Intel), macOS ARM64 (Apple Silicon)
 
 ## 🎯 Basic Usage
 
@@ -76,7 +80,7 @@ The included `setup_build_environment.sh` provides:
 ```yaml
 jobs:
   build:
-    runs-on: [self-hosted, myrepo]  # Use your repo name as label
+    runs-on: [self-hosted, myrepo]  # Labels: self-hosted, <os>, <arch>, <repo>
     steps:
       - uses: actions/checkout@v4
       - run: cargo build --release
