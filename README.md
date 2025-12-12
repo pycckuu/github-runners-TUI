@@ -61,6 +61,9 @@ chmod +x *.sh
 
 # Health check
 ./health_check.sh
+
+# TUI Dashboard (htop-like)
+./runner-dashboard/target/release/runner-dashboard
 ```
 
 ## 🔧 Build Environment Features
@@ -113,6 +116,36 @@ jobs:
 | `list_repos.sh` | Show repository and runner status |
 | `health_check.sh` | Check runner health and system resources |
 | `update_all.sh` | Update all runners to latest version |
+| `runner-dashboard` | TUI dashboard for real-time monitoring |
+
+## 📊 Runner Dashboard
+
+An htop-like TUI dashboard for real-time runner monitoring.
+
+### Build & Run
+```bash
+cd runner-dashboard
+cargo build --release
+./target/release/runner-dashboard
+```
+
+### Features
+- Real-time runner status with color coding (green=active, yellow=inactive, red=failed)
+- System stats (CPU, RAM, Load average)
+- Runner logs viewer
+- Interactive controls (start/stop/restart runners)
+
+### Keybindings
+| Key | Action |
+|:----|:-------|
+| `j/↓` | Move down |
+| `k/↑` | Move up |
+| `s` | Start selected runner |
+| `x` | Stop selected runner |
+| `r` | Restart selected runner |
+| `l` | Toggle logs view |
+| `?/h` | Show help |
+| `q` | Quit |
 
 ## 🔍 Troubleshooting
 

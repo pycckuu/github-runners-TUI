@@ -1,5 +1,2 @@
-# Ignore all folders
-*/
-
-# Exception: Keep doc folder tracked
-!doc/
+# Rust build artifacts
+runner-dashboard/target/
