@@ -1,4 +1,13 @@
 #!/bin/bash
+set -e
+
+# Load common functions
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [ ! -f "$SCRIPT_DIR/common.sh" ]; then
+    echo "Error: common.sh not found in $SCRIPT_DIR" >&2
+    exit 1
+fi
+source "$SCRIPT_DIR/common.sh"
 
 if [ "$#" -lt 2 ]; then
     echo "Usage: $0 <repo-name> <runner-number>"
@@ -12,17 +21,28 @@ fi
 REPO_NAME=$1
 RUNNER_NUM=$2
 
-# Function to find service name for a specific runner
+# Validate inputs
+validate_repo_name "$REPO_NAME" || exit 1
+validate_runner_num "$RUNNER_NUM" || exit 1
+
+# Auto-detect OS for platform-specific handling
+detect_os
+
+# Function to find service name for a specific runner (Linux only)
 find_runner_service() {
     local repo=$1
     local num=$2
-    sudo systemctl list-units --all --type=service | grep "actions.runner.*${repo}-runner-${num}" | awk '{print $1}'
+    if [ "$OS" == "linux" ]; then
+        sudo systemctl list-units --all --type=service | grep "actions.runner.*${repo}-runner-${num}" | awk '{print $1}'
+    fi
 }
 
-# Function to find all services for a repository
+# Function to find all services for a repository (Linux only)
 find_repo_services() {
     local repo=$1
-    sudo systemctl list-units --all --type=service | grep "actions.runner.*${repo}-runner-" | awk '{print $1}'
+    if [ "$OS" == "linux" ]; then
+        sudo systemctl list-units --all --type=service | grep "actions.runner.*${repo}-runner-" | awk '{print $1}'
+    fi
 }
 
 # Function to remove a single runner
@@ -39,23 +59,28 @@ remove_single_runner() {
         return 1
     fi
 
-    # Find and stop the service
-    local service_name=$(find_runner_service "$repo" "$num")
-    if [ -n "$service_name" ]; then
-        echo "  Stopping service: $service_name"
-        sudo systemctl stop "$service_name" 2>/dev/null || echo "  ⚠️  Service stop failed or already stopped"
+    # Find and stop the service (platform-specific)
+    if [ "$OS" == "linux" ]; then
+        local service_name
+        service_name=$(find_runner_service "$repo" "$num")
+        if [ -n "$service_name" ]; then
+            echo "  Stopping service: $service_name"
+            sudo systemctl stop "$service_name" 2>/dev/null || echo "  ⚠️  Service stop failed or already stopped"
 
-        echo "  Disabling service: $service_name"
-        sudo systemctl disable "$service_name" 2>/dev/null || echo "  ⚠️  Service disable failed"
+            echo "  Disabling service: $service_name"
+            sudo systemctl disable "$service_name" 2>/dev/null || echo "  ⚠️  Service disable failed"
+        else
+            echo "  ⚠️  No systemd service found for runner $num"
+        fi
     else
-        echo "  ⚠️  No systemd service found for runner $num"
+        echo "  Stopping service using svc.sh (macOS)..."
     fi
 
     # Try to uninstall using svc.sh if it exists
     cd "$runner_dir"
     if [ -f "svc.sh" ]; then
         echo "  Uninstalling service using svc.sh..."
-        sudo ./svc.sh uninstall 2>/dev/null || echo "  ⚠️  svc.sh uninstall failed"
+        run_service_command "uninstall" 2>/dev/null || echo "  ⚠️  svc.sh uninstall failed"
     fi
 
     # Remove from GitHub (this will prompt for token)
@@ -70,7 +95,7 @@ remove_single_runner() {
     read -r confirm
     if [[ "$confirm" == "y" || "$confirm" == "Y" ]]; then
         cd "$HOME/action-runners"
-        rm -rf "${repo}/${num}"
+        rm -rf "${repo:?Repository name required}/${num:?Runner number required}"
         echo "  ✅ Runner directory deleted"
     else
         echo "  📁 Runner directory preserved at: $runner_dir"

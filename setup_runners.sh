@@ -1,6 +1,14 @@
 #!/bin/bash
 set -e
 
+# Load common functions
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [ ! -f "$SCRIPT_DIR/common.sh" ]; then
+    echo "Error: common.sh not found in $SCRIPT_DIR" >&2
+    exit 1
+fi
+source "$SCRIPT_DIR/common.sh"
+
 # Check if required arguments are provided
 if [ "$#" -lt 1 ]; then
     echo "Usage: $0 <github-repo> [num-runners]"
@@ -12,17 +20,21 @@ fi
 # Configuration variables
 GITHUB_REPO=$1
 NUM_RUNNERS=${2:-4}  # Use the second argument or default to 4 runners
+
+# Validate inputs
+validate_github_repo "$GITHUB_REPO" || exit 1
+if ! [[ "$NUM_RUNNERS" =~ ^[0-9]+$ ]] || [ "$NUM_RUNNERS" -lt 1 ] || [ "$NUM_RUNNERS" -gt 100 ]; then
+    echo "Error: Number of runners must be between 1-100" >&2
+    exit 1
+fi
+
 REPO_NAME=$(echo "$GITHUB_REPO" | cut -d'/' -f2)  # Extract repo name from org/repo
 REPO_URL="https://github.com/${GITHUB_REPO}"
 BASE_DIR="$HOME/action-runners/${REPO_NAME}"
 RUNNER_VERSION="2.330.0"
 
 # Auto-detect OS (GitHub uses 'osx' for macOS)
-case "$(uname -s)" in
-    Linux*)  OS="linux";;
-    Darwin*) OS="osx";;
-    *)       echo "Unsupported OS: $(uname -s)"; exit 1;;
-esac
+detect_os
 
 # Auto-detect architecture
 case "$(uname -m)" in
@@ -91,8 +103,8 @@ setup_runner() {
     read -r install_service
 
     if [[ "$install_service" == "y" || "$install_service" == "Y" ]]; then
-        ./svc.sh install
-        ./svc.sh start
+        run_service_command "install"
+        run_service_command "start"
         echo "Runner ${runner_number} installed and started as a service."
     else
         echo "To start the runner manually, use: cd ${runner_dir} && ./run.sh"
