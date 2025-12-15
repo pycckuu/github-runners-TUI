@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -70,80 +71,75 @@ impl Runner {
 
 /// Discover all runners from the action-runners directory
 pub fn discover_runners() -> Result<Vec<Runner>> {
-    let mut runners = Vec::new();
-
     let home = dirs::home_dir().ok_or_else(|| anyhow::anyhow!("Cannot find home directory"))?;
     let runners_dir = home.join("action-runners");
 
     if !runners_dir.exists() {
-        return Ok(runners);
+        return Ok(Vec::new());
     }
 
-    // Get current username for service naming
     let username = std::env::var("USER").unwrap_or_else(|_| "unknown".to_string());
+    let mut runners = Vec::new();
 
-    // Iterate through repository directories
     for repo_entry in std::fs::read_dir(&runners_dir)? {
-        let repo_entry = repo_entry?;
-        let repo_path = repo_entry.path();
-
+        let repo_path = repo_entry?.path();
         if !repo_path.is_dir() {
             continue;
         }
 
-        let repo_name = repo_path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("")
-            .to_string();
+        let Some(repo_name) = repo_path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
 
         if repo_name.is_empty() {
             continue;
         }
 
-        // Iterate through runner directories within the repo
-        for runner_entry in std::fs::read_dir(&repo_path)? {
-            let runner_entry = runner_entry?;
-            let runner_path = runner_entry.path();
-
-            if !runner_path.is_dir() {
-                continue;
-            }
-
-            // Check if this looks like a runner directory (has run.sh)
-            if !runner_path.join("run.sh").exists() {
-                continue;
-            }
-
-            let runner_num_str = runner_path
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or("0");
-
-            let runner_num: u32 = runner_num_str.parse().unwrap_or(0);
-
-            let service_name = format!(
-                "actions.runner.{}.{}-runner-{}",
-                username, &repo_name, runner_num
-            );
-
-            let status = get_service_status(&service_name, &runner_path);
-
-            runners.push(Runner {
-                name: format!("runner-{}", runner_num),
-                number: runner_num,
-                repo: repo_name.to_string(),
-                status,
-                service_name,
-                path: runner_path,
-            });
-        }
+        discover_repo_runners(&repo_path, repo_name, &username, &mut runners)?;
     }
 
-    // Sort runners by repo then by number
     runners.sort_by(|a, b| a.repo.cmp(&b.repo).then_with(|| a.number.cmp(&b.number)));
-
     Ok(runners)
+}
+
+/// Discover runners within a single repository directory
+fn discover_repo_runners(
+    repo_path: &Path,
+    repo_name: &str,
+    username: &str,
+    runners: &mut Vec<Runner>,
+) -> Result<()> {
+    for runner_entry in std::fs::read_dir(repo_path)? {
+        let runner_path = runner_entry?.path();
+
+        if !runner_path.is_dir() || !runner_path.join("run.sh").exists() {
+            continue;
+        }
+
+        let runner_num: u32 = runner_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
+
+        let service_name = format!(
+            "actions.runner.{}.{}-runner-{}",
+            username, repo_name, runner_num
+        );
+
+        let status = get_service_status(&service_name, &runner_path);
+
+        runners.push(Runner {
+            name: format!("runner-{}", runner_num),
+            number: runner_num,
+            repo: repo_name.to_string(),
+            status,
+            service_name,
+            path: runner_path,
+        });
+    }
+
+    Ok(())
 }
 
 /// Get the status of a runner service (cross-platform)
@@ -153,6 +149,27 @@ fn get_service_status(service_name: &str, runner_path: &std::path::Path) -> Runn
     } else {
         get_linux_service_status(service_name, runner_path)
     }
+}
+
+/// Get service status on Linux using cached systemctl data.
+fn get_linux_service_status_cached(
+    service_name: &str,
+    runner_path: &std::path::Path,
+    systemctl_cache: &HashMap<String, String>,
+    running_processes: &HashMap<PathBuf, bool>,
+) -> RunnerStatus {
+    // Try cached systemctl status
+    if let Some(status_str) = systemctl_cache.get(service_name) {
+        match status_str.as_str() {
+            "active" => return RunnerStatus::Active,
+            "inactive" => return RunnerStatus::Inactive,
+            "failed" => return RunnerStatus::Failed,
+            _ => {}
+        }
+    }
+
+    // Fallback: check if runner process is running using cached data
+    check_runner_status_fallback_cached(runner_path, running_processes)
 }
 
 /// Get service status on Linux using systemctl with process-based fallback
@@ -166,15 +183,40 @@ fn get_linux_service_status(service_name: &str, runner_path: &std::path::Path) -
     check_runner_status_fallback(runner_path)
 }
 
-/// Check systemd service status, returns None if service doesn't exist
-fn check_systemd_service_status(service_name: &str) -> Option<RunnerStatus> {
-    let unit_exists = Command::new("systemctl")
+/// Check if a systemd service unit exists
+fn systemctl_unit_exists(service_name: &str) -> bool {
+    Command::new("systemctl")
         .args(["cat", service_name])
         .output()
         .map(|o| o.status.success())
-        .unwrap_or(false);
+        .unwrap_or(false)
+}
 
-    if !unit_exists {
+/// Get all systemd service statuses in a batch, returning service name to status mapping.
+fn get_all_systemctl_services(service_names: &[String]) -> HashMap<String, String> {
+    let mut result = HashMap::new();
+
+    for service_name in service_names {
+        if !systemctl_unit_exists(service_name) {
+            continue;
+        }
+
+        // Get status
+        if let Ok(output) = Command::new("systemctl")
+            .args(["is-active", service_name])
+            .output()
+        {
+            let status = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            result.insert(service_name.clone(), status);
+        }
+    }
+
+    result
+}
+
+/// Check systemd service status, returns None if service doesn't exist
+fn check_systemd_service_status(service_name: &str) -> Option<RunnerStatus> {
+    if !systemctl_unit_exists(service_name) {
         return None;
     }
 
@@ -188,8 +230,24 @@ fn check_systemd_service_status(service_name: &str) -> Option<RunnerStatus> {
         "active" => Some(RunnerStatus::Active),
         "inactive" => Some(RunnerStatus::Inactive),
         "failed" => Some(RunnerStatus::Failed),
-        _ => None, // Fall through to process check
+        _ => None,
     }
+}
+
+/// Check runner status using cached process data and configuration file checks
+fn check_runner_status_fallback_cached(
+    runner_path: &std::path::Path,
+    running_processes: &HashMap<PathBuf, bool>,
+) -> RunnerStatus {
+    if *running_processes.get(runner_path).unwrap_or(&false) {
+        return RunnerStatus::Active;
+    }
+
+    if runner_path.join(".runner").exists() {
+        return RunnerStatus::Inactive;
+    }
+
+    RunnerStatus::NotFound
 }
 
 /// Check runner status using process and configuration file checks
@@ -203,6 +261,29 @@ fn check_runner_status_fallback(runner_path: &std::path::Path) -> RunnerStatus {
     }
 
     RunnerStatus::NotFound
+}
+
+/// Get service status on macOS using cached launchctl data.
+fn get_macos_service_status_cached(
+    service_name: &str,
+    runner_path: &std::path::Path,
+    launchctl_output: Option<&str>,
+    running_processes: &HashMap<PathBuf, bool>,
+) -> RunnerStatus {
+    // Try exact service name match
+    if let Some(status) = check_launchctl_exact_service(service_name) {
+        return status;
+    }
+
+    // Try partial match using cached launchctl output
+    if let Some(output) = launchctl_output {
+        if let Some(status) = check_launchctl_partial_match_cached(runner_path, output) {
+            return status;
+        }
+    }
+
+    // Fallback: check runner process and configuration using cached data
+    check_runner_status_fallback_cached(runner_path, running_processes)
 }
 
 /// Get service status on macOS using launchctl or process check
@@ -244,21 +325,28 @@ fn check_launchctl_exact_service(service_name: &str) -> Option<RunnerStatus> {
     }
 }
 
-/// Check launchctl list for partial service name match
-fn check_launchctl_partial_match(runner_path: &std::path::Path) -> Option<RunnerStatus> {
+/// Get all launchctl services in a single call for parsing by multiple callers.
+fn get_all_launchctl_services() -> Option<String> {
     let output = Command::new("launchctl").arg("list").output().ok()?;
 
     if !output.status.success() {
         return None;
     }
 
-    let stdout = String::from_utf8_lossy(&output.stdout);
+    Some(String::from_utf8_lossy(&output.stdout).to_string())
+}
+
+/// Check launchctl list for partial service name match using cached output
+fn check_launchctl_partial_match_cached(
+    runner_path: &std::path::Path,
+    launchctl_output: &str,
+) -> Option<RunnerStatus> {
     let parent_dir = runner_path
         .parent()
         .and_then(|p| p.file_name())
         .and_then(|n| n.to_str())?;
 
-    for line in stdout.lines() {
+    for line in launchctl_output.lines() {
         if line.contains("actions.runner") && line.contains(parent_dir) {
             let parts: Vec<&str> = line.split_whitespace().collect();
             if let Some(pid) = parts.first() {
@@ -270,6 +358,36 @@ fn check_launchctl_partial_match(runner_path: &std::path::Path) -> Option<Runner
     }
 
     None
+}
+
+/// Check launchctl list for partial service name match
+fn check_launchctl_partial_match(runner_path: &std::path::Path) -> Option<RunnerStatus> {
+    let launchctl_output = get_all_launchctl_services()?;
+    check_launchctl_partial_match_cached(runner_path, &launchctl_output)
+}
+
+/// Batch check all runner processes with a single pgrep call.
+///
+/// Returns a HashMap indicating which runner paths have running processes.
+fn batch_check_running_processes(runner_paths: &[PathBuf]) -> HashMap<PathBuf, bool> {
+    let mut result: HashMap<PathBuf, bool> =
+        runner_paths.iter().map(|p| (p.clone(), false)).collect();
+
+    let output = match Command::new("pgrep").args(["-af", "Runner"]).output() {
+        Ok(output) if output.status.success() => output,
+        _ => return result,
+    };
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    for path in runner_paths {
+        let path_str = path.to_string_lossy();
+        if stdout.lines().any(|line| line.contains(&*path_str)) {
+            result.insert(path.clone(), true);
+        }
+    }
+
+    result
 }
 
 /// Check if a runner process is running by looking for Runner.Worker/Listener
@@ -302,10 +420,40 @@ fn is_runner_process_running(runner_path: &std::path::Path) -> bool {
     false
 }
 
-/// Refresh the status of all runners
+/// Refresh the status of all runners using batch operations.
+///
+/// Minimizes system calls by batching process checks and service queries.
 pub fn refresh_runners(runners: &mut [Runner]) {
-    for runner in runners.iter_mut() {
-        runner.status = get_service_status(&runner.service_name, &runner.path);
+    if runners.is_empty() {
+        return;
+    }
+
+    let runner_paths: Vec<PathBuf> = runners.iter().map(|r| r.path.clone()).collect();
+    let running_processes = batch_check_running_processes(&runner_paths);
+
+    if cfg!(target_os = "macos") {
+        let launchctl_output = get_all_launchctl_services();
+
+        for runner in runners.iter_mut() {
+            runner.status = get_macos_service_status_cached(
+                &runner.service_name,
+                &runner.path,
+                launchctl_output.as_deref(),
+                &running_processes,
+            );
+        }
+    } else {
+        let service_names: Vec<String> = runners.iter().map(|r| r.service_name.clone()).collect();
+        let systemctl_statuses = get_all_systemctl_services(&service_names);
+
+        for runner in runners.iter_mut() {
+            runner.status = get_linux_service_status_cached(
+                &runner.service_name,
+                &runner.path,
+                &systemctl_statuses,
+                &running_processes,
+            );
+        }
     }
 }
 
@@ -360,13 +508,7 @@ fn control_runner_linux(runner: &Runner, action: &str) -> Result<String> {
 
 /// Attempt to control runner using systemctl, returns None if service doesn't exist
 fn try_systemctl_control(runner: &Runner, action: &str) -> Result<Option<String>> {
-    let unit_exists = Command::new("systemctl")
-        .args(["cat", &runner.service_name])
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false);
-
-    if !unit_exists {
+    if !systemctl_unit_exists(&runner.service_name) {
         return Ok(None);
     }
 
@@ -374,6 +516,15 @@ fn try_systemctl_control(runner: &Runner, action: &str) -> Result<Option<String>
         .args(["systemctl", action, &runner.service_name])
         .output()?;
 
+    handle_control_output(output, action, runner)
+}
+
+/// Handle output from a control command and format result
+fn handle_control_output(
+    output: std::process::Output,
+    action: &str,
+    runner: &Runner,
+) -> Result<Option<String>> {
     if output.status.success() {
         Ok(Some(format!(
             "Successfully {}ed {}",
@@ -388,6 +539,29 @@ fn try_systemctl_control(runner: &Runner, action: &str) -> Result<Option<String>
             runner.display_name(),
             stderr
         ))
+    }
+}
+
+/// Execute a script command, optionally with sudo
+fn run_script(
+    script_path: &Path,
+    arg: &str,
+    working_dir: &Path,
+    use_sudo: bool,
+) -> Result<std::process::Output> {
+    if use_sudo {
+        Command::new("sudo")
+            .arg(script_path)
+            .arg(arg)
+            .current_dir(working_dir)
+            .output()
+            .map_err(Into::into)
+    } else {
+        Command::new(script_path)
+            .arg(arg)
+            .current_dir(working_dir)
+            .output()
+            .map_err(Into::into)
     }
 }
 
@@ -403,34 +577,8 @@ fn try_svc_script_control(runner: &Runner, action: &str, use_sudo: bool) -> Resu
         install_service(&svc_script, &runner.path, runner, use_sudo)?;
     }
 
-    let output = if use_sudo {
-        Command::new("sudo")
-            .arg(&svc_script)
-            .arg(action)
-            .current_dir(&runner.path)
-            .output()?
-    } else {
-        Command::new(&svc_script)
-            .arg(action)
-            .current_dir(&runner.path)
-            .output()?
-    };
-
-    if output.status.success() {
-        Ok(Some(format!(
-            "Successfully {}ed {}",
-            action,
-            runner.display_name()
-        )))
-    } else {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        Err(anyhow::anyhow!(
-            "Failed to {} {}: {}",
-            action,
-            runner.display_name(),
-            stderr
-        ))
-    }
+    let output = run_script(&svc_script, action, &runner.path, use_sudo)?;
+    handle_control_output(output, action, runner)
 }
 
 /// Check if service needs installation by running status command
@@ -439,20 +587,7 @@ fn needs_service_installation(
     runner_path: &Path,
     use_sudo: bool,
 ) -> Result<bool> {
-    let status_output = if use_sudo {
-        Command::new("sudo")
-            .arg(svc_script)
-            .arg("status")
-            .current_dir(runner_path)
-            .output()
-    } else {
-        Command::new(svc_script)
-            .arg("status")
-            .current_dir(runner_path)
-            .output()
-    };
-
-    match status_output {
+    match run_script(svc_script, "status", runner_path, use_sudo) {
         Ok(output) => {
             let stdout = String::from_utf8_lossy(&output.stdout);
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -469,21 +604,10 @@ fn install_service(
     runner: &Runner,
     use_sudo: bool,
 ) -> Result<()> {
-    let install_output = if use_sudo {
-        Command::new("sudo")
-            .arg(svc_script)
-            .arg("install")
-            .current_dir(runner_path)
-            .output()?
-    } else {
-        Command::new(svc_script)
-            .arg("install")
-            .current_dir(runner_path)
-            .output()?
-    };
+    let output = run_script(svc_script, "install", runner_path, use_sudo)?;
 
-    if !install_output.status.success() {
-        let stderr = String::from_utf8_lossy(&install_output.stderr);
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
         return Err(anyhow::anyhow!(
             "Failed to install service for {}: {}",
             runner.display_name(),
@@ -594,55 +718,29 @@ fn try_launchctl_control(runner: &Runner, action: &str) -> Result<Option<String>
         return Ok(None);
     }
 
-    let launchctl_action = match action {
-        "start" => "load",
-        "stop" => "unload",
-        "restart" => "kickstart",
-        _ => return Err(anyhow::anyhow!("Invalid action")),
-    };
-
-    let output = if action == "restart" {
-        Command::new("launchctl")
+    let output = match action {
+        "restart" => Command::new("launchctl")
             .args([
                 "kickstart",
                 "-k",
                 &format!("gui/{}/{}", get_uid(), runner.service_name),
             ])
-            .output()?
-    } else {
-        Command::new("launchctl")
-            .args([launchctl_action, expanded_plist.as_ref()])
-            .output()?
+            .output()?,
+        "start" => Command::new("launchctl")
+            .args(["load", expanded_plist.as_ref()])
+            .output()?,
+        "stop" => Command::new("launchctl")
+            .args(["unload", expanded_plist.as_ref()])
+            .output()?,
+        _ => return Err(anyhow::anyhow!("Invalid action")),
     };
 
-    if output.status.success() {
-        Ok(Some(format!(
-            "Successfully {}ed {}",
-            action,
-            runner.display_name()
-        )))
-    } else {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        Err(anyhow::anyhow!(
-            "Failed to {} {}: {}",
-            action,
-            runner.display_name(),
-            stderr
-        ))
-    }
+    handle_control_output(output, action, runner)
 }
 
 /// Get current user ID for launchctl service domain.
-///
-/// # Safety
-/// This is safe because `libc::getuid()` is a simple read-only system call that:
-/// - Always succeeds (no error conditions)
-/// - Has no side effects
-/// - Only reads process state
-/// - Returns a primitive value (u32)
 fn get_uid() -> u32 {
-    // SAFETY: libc::getuid() is always safe to call - it's a simple
-    // read-only syscall with no failure modes or preconditions
+    // SAFETY: getuid() is a read-only syscall with no side effects or failure modes
     unsafe { libc::getuid() }
 }
 
@@ -681,10 +779,25 @@ fn get_runner_logs_macos(runner: &Runner, lines: usize) -> Result<Vec<String>> {
         return Ok(vec!["No logs found (no _diag directory)".to_string()]);
     }
 
-    // Find the most recent Worker log file
-    let mut log_files: Vec<_> = std::fs::read_dir(&diag_dir)?
+    // Try to find the most recent Worker log, then Runner log
+    for prefix in ["Worker_", "Runner_"] {
+        if let Some(content) = find_latest_log_file(&diag_dir, prefix, lines)? {
+            return Ok(content);
+        }
+    }
+
+    Ok(vec!["No log files found in _diag".to_string()])
+}
+
+/// Find and read the most recent log file with the given prefix
+fn find_latest_log_file(
+    diag_dir: &Path,
+    prefix: &str,
+    lines: usize,
+) -> Result<Option<Vec<String>>> {
+    let mut log_files: Vec<_> = std::fs::read_dir(diag_dir)?
         .filter_map(|e| e.ok())
-        .filter(|e| e.file_name().to_string_lossy().starts_with("Worker_"))
+        .filter(|e| e.file_name().to_string_lossy().starts_with(prefix))
         .collect();
 
     log_files.sort_by_key(|e| std::cmp::Reverse(e.metadata().ok().and_then(|m| m.modified().ok())));
@@ -693,24 +806,8 @@ fn get_runner_logs_macos(runner: &Runner, lines: usize) -> Result<Vec<String>> {
         let content = std::fs::read_to_string(latest_log.path())?;
         let all_lines: Vec<String> = content.lines().map(|s| s.to_string()).collect();
         let start = all_lines.len().saturating_sub(lines);
-        Ok(all_lines[start..].to_vec())
+        Ok(Some(all_lines[start..].to_vec()))
     } else {
-        // Try Runner log if no Worker log
-        let mut runner_logs: Vec<_> = std::fs::read_dir(&diag_dir)?
-            .filter_map(|e| e.ok())
-            .filter(|e| e.file_name().to_string_lossy().starts_with("Runner_"))
-            .collect();
-
-        runner_logs
-            .sort_by_key(|e| std::cmp::Reverse(e.metadata().ok().and_then(|m| m.modified().ok())));
-
-        if let Some(latest_log) = runner_logs.first() {
-            let content = std::fs::read_to_string(latest_log.path())?;
-            let all_lines: Vec<String> = content.lines().map(|s| s.to_string()).collect();
-            let start = all_lines.len().saturating_sub(lines);
-            Ok(all_lines[start..].to_vec())
-        } else {
-            Ok(vec!["No log files found in _diag".to_string()])
-        }
+        Ok(None)
     }
 }

@@ -58,6 +58,9 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App)
     let mut last_refresh = Instant::now();
 
     loop {
+        // Poll for updates from background worker (non-blocking)
+        app.poll_worker_updates();
+
         // Draw UI
         terminal.draw(|f| ui::draw(f, app))?;
 
@@ -90,7 +93,7 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App)
             }
         }
 
-        // Periodic refresh
+        // Request periodic refresh (non-blocking)
         if last_refresh.elapsed() >= refresh_rate {
             app.refresh();
             last_refresh = Instant::now();
