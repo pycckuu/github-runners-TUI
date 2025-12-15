@@ -2,20 +2,25 @@ use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+/// Shell metacharacters that could enable command injection
+const DANGEROUS_CHARS: &[char] = &[
+    ';', '&', '|', '`', '$', '\n', '\r', '\'', '"', '(', ')', '{', '}', '<', '>', '*', '?', '[',
+    ']', '!', '#',
+];
+
 /// Validate that a path doesn't contain shell metacharacters that could enable command injection
 fn validate_path(path: &Path) -> Result<()> {
     let path_str = path.to_string_lossy();
-    if path_str.contains(';')
-        || path_str.contains('&')
-        || path_str.contains('|')
-        || path_str.contains('`')
-        || path_str.contains('$')
-        || path_str.contains('\n')
-    {
-        return Err(anyhow::anyhow!(
-            "Invalid path: contains shell metacharacters"
-        ));
+
+    for c in DANGEROUS_CHARS {
+        if path_str.contains(*c) {
+            return Err(anyhow::anyhow!(
+                "Invalid path: contains shell metacharacter '{}'",
+                c
+            ));
+        }
     }
+
     Ok(())
 }
 
@@ -146,87 +151,53 @@ fn get_service_status(service_name: &str, runner_path: &std::path::Path) -> Runn
     if cfg!(target_os = "macos") {
         get_macos_service_status(service_name, runner_path)
     } else {
-        get_linux_service_status(service_name)
+        get_linux_service_status(service_name, runner_path)
     }
 }
 
-/// Get service status on Linux using systemctl
-fn get_linux_service_status(service_name: &str) -> RunnerStatus {
+/// Get service status on Linux using systemctl with process-based fallback
+fn get_linux_service_status(service_name: &str, runner_path: &std::path::Path) -> RunnerStatus {
+    // Try to get status from systemd service unit
+    if let Some(status) = check_systemd_service_status(service_name) {
+        return status;
+    }
+
+    // Fallback: check if runner process is running
+    check_runner_status_fallback(runner_path)
+}
+
+/// Check systemd service status, returns None if service doesn't exist
+fn check_systemd_service_status(service_name: &str) -> Option<RunnerStatus> {
+    let unit_exists = Command::new("systemctl")
+        .args(["cat", service_name])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+
+    if !unit_exists {
+        return None;
+    }
+
     let output = Command::new("systemctl")
         .args(["is-active", service_name])
-        .output();
+        .output()
+        .ok()?;
 
-    match output {
-        Ok(output) => {
-            let status = String::from_utf8_lossy(&output.stdout).trim().to_string();
-            match status.as_str() {
-                "active" => RunnerStatus::Active,
-                "inactive" => RunnerStatus::Inactive,
-                "failed" => RunnerStatus::Failed,
-                _ => RunnerStatus::NotFound,
-            }
-        }
-        Err(_) => RunnerStatus::NotFound,
+    let status = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    match status.as_str() {
+        "active" => Some(RunnerStatus::Active),
+        "inactive" => Some(RunnerStatus::Inactive),
+        "failed" => Some(RunnerStatus::Failed),
+        _ => None, // Fall through to process check
     }
 }
 
-/// Get service status on macOS using launchctl or process check
-fn get_macos_service_status(service_name: &str, runner_path: &std::path::Path) -> RunnerStatus {
-    // First try launchctl list with exact service name
-    let output = Command::new("launchctl")
-        .args(["list", service_name])
-        .output();
-
-    if let Ok(output) = output {
-        if output.status.success() {
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            // launchctl list <service> returns info if service exists
-            // Check if PID is present (first column, non-hyphen means running)
-            if let Some(first_line) = stdout.lines().next() {
-                let parts: Vec<&str> = first_line.split_whitespace().collect();
-                if let Some(pid) = parts.first() {
-                    if *pid != "-" && pid.parse::<u32>().is_ok() {
-                        return RunnerStatus::Active;
-                    } else if *pid == "-" {
-                        return RunnerStatus::Inactive;
-                    }
-                }
-            }
-            return RunnerStatus::Inactive;
-        }
-    }
-
-    // Fallback: search launchctl list for partial match (service name might differ slightly)
-    let output = Command::new("launchctl").arg("list").output();
-    if let Ok(output) = output {
-        if output.status.success() {
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            // Look for any line containing "actions.runner" and the repo name from path
-            let parent_dir = runner_path
-                .parent()
-                .and_then(|p| p.file_name())
-                .and_then(|n| n.to_str())
-                .unwrap_or("");
-
-            for line in stdout.lines() {
-                if line.contains("actions.runner") && line.contains(parent_dir) {
-                    let parts: Vec<&str> = line.split_whitespace().collect();
-                    if let Some(pid) = parts.first() {
-                        if *pid != "-" && pid.parse::<u32>().is_ok() {
-                            return RunnerStatus::Active;
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    // Fallback: check if Runner.Worker or Runner.Listener process is running for this path
+/// Check runner status using process and configuration file checks
+fn check_runner_status_fallback(runner_path: &std::path::Path) -> RunnerStatus {
     if is_runner_process_running(runner_path) {
         return RunnerStatus::Active;
     }
 
-    // Check if .runner file exists (indicates configured but not running)
     if runner_path.join(".runner").exists() {
         return RunnerStatus::Inactive;
     }
@@ -234,8 +205,80 @@ fn get_macos_service_status(service_name: &str, runner_path: &std::path::Path) -
     RunnerStatus::NotFound
 }
 
+/// Get service status on macOS using launchctl or process check
+fn get_macos_service_status(service_name: &str, runner_path: &std::path::Path) -> RunnerStatus {
+    // Try exact service name match
+    if let Some(status) = check_launchctl_exact_service(service_name) {
+        return status;
+    }
+
+    // Try partial match for service name variations
+    if let Some(status) = check_launchctl_partial_match(runner_path) {
+        return status;
+    }
+
+    // Fallback: check runner process and configuration
+    check_runner_status_fallback(runner_path)
+}
+
+/// Check launchctl for exact service name match
+fn check_launchctl_exact_service(service_name: &str) -> Option<RunnerStatus> {
+    let output = Command::new("launchctl")
+        .args(["list", service_name])
+        .output()
+        .ok()?;
+
+    if !output.status.success() {
+        return None;
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let first_line = stdout.lines().next()?;
+    let parts: Vec<&str> = first_line.split_whitespace().collect();
+    let pid = parts.first()?;
+
+    if *pid != "-" && pid.parse::<u32>().is_ok() {
+        Some(RunnerStatus::Active)
+    } else {
+        Some(RunnerStatus::Inactive)
+    }
+}
+
+/// Check launchctl list for partial service name match
+fn check_launchctl_partial_match(runner_path: &std::path::Path) -> Option<RunnerStatus> {
+    let output = Command::new("launchctl").arg("list").output().ok()?;
+
+    if !output.status.success() {
+        return None;
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let parent_dir = runner_path
+        .parent()
+        .and_then(|p| p.file_name())
+        .and_then(|n| n.to_str())?;
+
+    for line in stdout.lines() {
+        if line.contains("actions.runner") && line.contains(parent_dir) {
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            if let Some(pid) = parts.first() {
+                if *pid != "-" && pid.parse::<u32>().is_ok() {
+                    return Some(RunnerStatus::Active);
+                }
+            }
+        }
+    }
+
+    None
+}
+
 /// Check if a runner process is running by looking for Runner.Worker/Listener
 fn is_runner_process_running(runner_path: &std::path::Path) -> bool {
+    // Validate path to prevent command injection via pgrep pattern
+    if validate_path(runner_path).is_err() {
+        return false;
+    }
+
     let path_str = runner_path.to_string_lossy();
 
     // Patterns to search for (Runner.Worker, Runner.Listener, or just the path in any dotnet process)
@@ -299,18 +342,44 @@ pub fn control_runner(runner: &Runner, action: &str) -> Result<String> {
     }
 }
 
-/// Control runner on Linux using systemctl
+/// Control runner on Linux using systemctl with svc.sh/run.sh fallback
 fn control_runner_linux(runner: &Runner, action: &str) -> Result<String> {
+    // Try systemctl first
+    if let Some(result) = try_systemctl_control(runner, action)? {
+        return Ok(result);
+    }
+
+    // Fallback to svc.sh script
+    if let Some(result) = try_svc_script_control(runner, action, true)? {
+        return Ok(result);
+    }
+
+    // Final fallback: direct run.sh control
+    control_runner_direct(runner, action)
+}
+
+/// Attempt to control runner using systemctl, returns None if service doesn't exist
+fn try_systemctl_control(runner: &Runner, action: &str) -> Result<Option<String>> {
+    let unit_exists = Command::new("systemctl")
+        .args(["cat", &runner.service_name])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+
+    if !unit_exists {
+        return Ok(None);
+    }
+
     let output = Command::new("sudo")
         .args(["systemctl", action, &runner.service_name])
         .output()?;
 
     if output.status.success() {
-        Ok(format!(
+        Ok(Some(format!(
             "Successfully {}ed {}",
             action,
             runner.display_name()
-        ))
+        )))
     } else {
         let stderr = String::from_utf8_lossy(&output.stderr);
         Err(anyhow::anyhow!(
@@ -322,174 +391,244 @@ fn control_runner_linux(runner: &Runner, action: &str) -> Result<String> {
     }
 }
 
+/// Attempt to control runner using svc.sh script, returns None if script doesn't exist
+fn try_svc_script_control(runner: &Runner, action: &str, use_sudo: bool) -> Result<Option<String>> {
+    let svc_script = runner.path.join("svc.sh");
+    if !svc_script.exists() {
+        return Ok(None);
+    }
+
+    // For start action, ensure service is installed first
+    if action == "start" && needs_service_installation(&svc_script, &runner.path, use_sudo)? {
+        install_service(&svc_script, &runner.path, runner, use_sudo)?;
+    }
+
+    let output = if use_sudo {
+        Command::new("sudo")
+            .arg(&svc_script)
+            .arg(action)
+            .current_dir(&runner.path)
+            .output()?
+    } else {
+        Command::new(&svc_script)
+            .arg(action)
+            .current_dir(&runner.path)
+            .output()?
+    };
+
+    if output.status.success() {
+        Ok(Some(format!(
+            "Successfully {}ed {}",
+            action,
+            runner.display_name()
+        )))
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        Err(anyhow::anyhow!(
+            "Failed to {} {}: {}",
+            action,
+            runner.display_name(),
+            stderr
+        ))
+    }
+}
+
+/// Check if service needs installation by running status command
+fn needs_service_installation(
+    svc_script: &Path,
+    runner_path: &Path,
+    use_sudo: bool,
+) -> Result<bool> {
+    let status_output = if use_sudo {
+        Command::new("sudo")
+            .arg(svc_script)
+            .arg("status")
+            .current_dir(runner_path)
+            .output()
+    } else {
+        Command::new(svc_script)
+            .arg("status")
+            .current_dir(runner_path)
+            .output()
+    };
+
+    match status_output {
+        Ok(output) => {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            Ok(stdout.contains("not installed") || stderr.contains("not installed"))
+        }
+        Err(_) => Ok(true),
+    }
+}
+
+/// Install service using svc.sh install command
+fn install_service(
+    svc_script: &Path,
+    runner_path: &Path,
+    runner: &Runner,
+    use_sudo: bool,
+) -> Result<()> {
+    let install_output = if use_sudo {
+        Command::new("sudo")
+            .arg(svc_script)
+            .arg("install")
+            .current_dir(runner_path)
+            .output()?
+    } else {
+        Command::new(svc_script)
+            .arg("install")
+            .current_dir(runner_path)
+            .output()?
+    };
+
+    if !install_output.status.success() {
+        let stderr = String::from_utf8_lossy(&install_output.stderr);
+        return Err(anyhow::anyhow!(
+            "Failed to install service for {}: {}",
+            runner.display_name(),
+            stderr
+        ));
+    }
+
+    Ok(())
+}
+
+/// Control runner directly using run.sh script and process management
+fn control_runner_direct(runner: &Runner, action: &str) -> Result<String> {
+    validate_path(&runner.path)?;
+
+    let run_script = runner.path.join("run.sh");
+    let run_script_str = run_script
+        .to_str()
+        .ok_or_else(|| anyhow::anyhow!("Invalid UTF-8 in path: {:?}", run_script))?;
+
+    match action {
+        "start" => {
+            Command::new("nohup")
+                .arg(run_script_str)
+                .current_dir(&runner.path)
+                .spawn()
+                .with_context(|| format!("Failed to start runner {}", runner.display_name()))?;
+            Ok(format!("Started {}", runner.display_name()))
+        }
+        "stop" => {
+            stop_runner_process(runner)?;
+            Ok(format!("Stopped {}", runner.display_name()))
+        }
+        "restart" => {
+            restart_runner_process(runner, run_script_str)?;
+            Ok(format!("Restarted {}", runner.display_name()))
+        }
+        _ => Err(anyhow::anyhow!("Invalid action: {}", action)),
+    }
+}
+
+/// Stop runner process using pkill
+fn stop_runner_process(runner: &Runner) -> Result<()> {
+    // Validate path to prevent command injection via pkill pattern
+    validate_path(&runner.path)?;
+
+    let path_str = runner.path.to_string_lossy();
+    Command::new("pkill")
+        .args(["-f", &format!("Runner.*{}", path_str)])
+        .output()
+        .with_context(|| format!("Failed to stop runner {}", runner.display_name()))?;
+    Ok(())
+}
+
+/// Restart runner process by stopping, waiting for termination, and starting again
+fn restart_runner_process(runner: &Runner, run_script_str: &str) -> Result<()> {
+    // Validate path to prevent command injection via pkill pattern
+    validate_path(&runner.path)?;
+
+    let path_str = runner.path.to_string_lossy();
+    let _ = Command::new("pkill")
+        .args(["-f", &format!("Runner.*{}", path_str)])
+        .output();
+
+    // Poll for process termination (up to 5 seconds)
+    let timeout = std::time::Duration::from_secs(5);
+    let start = std::time::Instant::now();
+    while is_runner_process_running(&runner.path) {
+        if start.elapsed() > timeout {
+            return Err(anyhow::anyhow!(
+                "Timeout waiting for runner {} to stop",
+                runner.display_name()
+            ));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+
+    Command::new("nohup")
+        .arg(run_script_str)
+        .current_dir(&runner.path)
+        .spawn()
+        .with_context(|| format!("Failed to restart runner {}", runner.display_name()))?;
+
+    Ok(())
+}
+
 /// Control runner on macOS using launchctl or direct script
 fn control_runner_macos(runner: &Runner, action: &str) -> Result<String> {
+    // Try launchctl first
+    if let Some(result) = try_launchctl_control(runner, action)? {
+        return Ok(result);
+    }
+
+    // Fallback to svc.sh script (without sudo on macOS)
+    if let Some(result) = try_svc_script_control(runner, action, false)? {
+        return Ok(result);
+    }
+
+    // Final fallback: direct run.sh control
+    control_runner_direct(runner, action)
+}
+
+/// Attempt to control runner using launchctl, returns None if service doesn't exist
+fn try_launchctl_control(runner: &Runner, action: &str) -> Result<Option<String>> {
     let plist_path = format!("~/Library/LaunchAgents/{}.plist", runner.service_name);
     let expanded_plist = shellexpand::tilde(&plist_path);
 
-    // Check if launchctl service exists
-    let has_launchctl = std::path::Path::new(expanded_plist.as_ref()).exists();
+    if !std::path::Path::new(expanded_plist.as_ref()).exists() {
+        return Ok(None);
+    }
 
-    if has_launchctl {
-        // Use launchctl
-        let launchctl_action = match action {
-            "start" => "load",
-            "stop" => "unload",
-            "restart" => "kickstart",
-            _ => return Err(anyhow::anyhow!("Invalid action")),
-        };
+    let launchctl_action = match action {
+        "start" => "load",
+        "stop" => "unload",
+        "restart" => "kickstart",
+        _ => return Err(anyhow::anyhow!("Invalid action")),
+    };
 
-        let output = if action == "restart" {
-            Command::new("launchctl")
-                .args([
-                    "kickstart",
-                    "-k",
-                    &format!("gui/{}/{}", get_uid(), runner.service_name),
-                ])
-                .output()?
-        } else {
-            Command::new("launchctl")
-                .args([launchctl_action, expanded_plist.as_ref()])
-                .output()?
-        };
-
-        if output.status.success() {
-            Ok(format!(
-                "Successfully {}ed {}",
-                action,
-                runner.display_name()
-            ))
-        } else {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            Err(anyhow::anyhow!(
-                "Failed to {} {}: {}",
-                action,
-                runner.display_name(),
-                stderr
-            ))
-        }
+    let output = if action == "restart" {
+        Command::new("launchctl")
+            .args([
+                "kickstart",
+                "-k",
+                &format!("gui/{}/{}", get_uid(), runner.service_name),
+            ])
+            .output()?
     } else {
-        // Fallback: use svc.sh script in runner directory
-        let svc_script = runner.path.join("svc.sh");
-        if svc_script.exists() {
-            // For start action, ensure service is installed first
-            if action == "start" {
-                // Check if service is installed by running status
-                let status_output = Command::new(&svc_script)
-                    .arg("status")
-                    .current_dir(&runner.path)
-                    .output();
+        Command::new("launchctl")
+            .args([launchctl_action, expanded_plist.as_ref()])
+            .output()?
+    };
 
-                let needs_install = match status_output {
-                    Ok(output) => {
-                        let stdout = String::from_utf8_lossy(&output.stdout);
-                        let stderr = String::from_utf8_lossy(&output.stderr);
-                        stdout.contains("not installed") || stderr.contains("not installed")
-                    }
-                    Err(_) => true,
-                };
-
-                if needs_install {
-                    let install_output = Command::new(&svc_script)
-                        .arg("install")
-                        .current_dir(&runner.path)
-                        .output()?;
-
-                    if !install_output.status.success() {
-                        let stderr = String::from_utf8_lossy(&install_output.stderr);
-                        return Err(anyhow::anyhow!(
-                            "Failed to install service for {}: {}",
-                            runner.display_name(),
-                            stderr
-                        ));
-                    }
-                }
-            }
-
-            let output = Command::new(&svc_script)
-                .arg(action)
-                .current_dir(&runner.path)
-                .output()?;
-
-            if output.status.success() {
-                Ok(format!(
-                    "Successfully {}ed {}",
-                    action,
-                    runner.display_name()
-                ))
-            } else {
-                let stderr = String::from_utf8_lossy(&output.stderr);
-                Err(anyhow::anyhow!(
-                    "Failed to {} {}: {}",
-                    action,
-                    runner.display_name(),
-                    stderr
-                ))
-            }
-        } else {
-            // Direct run.sh control
-            // Validate path before using in commands
-            validate_path(&runner.path)?;
-
-            let run_script = runner.path.join("run.sh");
-            let run_script_str = run_script
-                .to_str()
-                .ok_or_else(|| anyhow::anyhow!("Invalid UTF-8 in path: {:?}", run_script))?;
-
-            match action {
-                "start" => {
-                    Command::new("nohup")
-                        .arg(run_script_str)
-                        .current_dir(&runner.path)
-                        .spawn()
-                        .with_context(|| {
-                            format!("Failed to start runner {}", runner.display_name())
-                        })?;
-                    Ok(format!("Started {}", runner.display_name()))
-                }
-                "stop" => {
-                    // Kill runner processes
-                    let path_str = runner.path.to_string_lossy();
-                    Command::new("pkill")
-                        .args(["-f", &format!("Runner.*{}", path_str)])
-                        .output()
-                        .with_context(|| {
-                            format!("Failed to stop runner {}", runner.display_name())
-                        })?;
-                    Ok(format!("Stopped {}", runner.display_name()))
-                }
-                "restart" => {
-                    // Stop then wait for process termination
-                    let path_str = runner.path.to_string_lossy();
-                    let _ = Command::new("pkill")
-                        .args(["-f", &format!("Runner.*{}", path_str)])
-                        .output();
-
-                    // Poll for process termination (up to 5 seconds)
-                    let timeout = std::time::Duration::from_secs(5);
-                    let start = std::time::Instant::now();
-                    while is_runner_process_running(&runner.path) {
-                        if start.elapsed() > timeout {
-                            return Err(anyhow::anyhow!(
-                                "Timeout waiting for runner {} to stop",
-                                runner.display_name()
-                            ));
-                        }
-                        std::thread::sleep(std::time::Duration::from_millis(100));
-                    }
-
-                    Command::new("nohup")
-                        .arg(run_script_str)
-                        .current_dir(&runner.path)
-                        .spawn()
-                        .with_context(|| {
-                            format!("Failed to restart runner {}", runner.display_name())
-                        })?;
-                    Ok(format!("Restarted {}", runner.display_name()))
-                }
-                _ => Err(anyhow::anyhow!("Invalid action: {}", action)),
-            }
-        }
+    if output.status.success() {
+        Ok(Some(format!(
+            "Successfully {}ed {}",
+            action,
+            runner.display_name()
+        )))
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        Err(anyhow::anyhow!(
+            "Failed to {} {}: {}",
+            action,
+            runner.display_name(),
+            stderr
+        ))
     }
 }
 
