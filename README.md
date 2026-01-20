@@ -113,6 +113,7 @@ jobs:
 | `setup_build_environment.sh` | Install comprehensive build tools and Rust |
 | `manage_repo.sh` | Manage runners for specific repository |
 | `manage_all.sh` | Manage all runners across repositories |
+| `remove_runner.sh` | Remove runners locally and from GitHub |
 | `list_repos.sh` | Show repository and runner status |
 | `health_check.sh` | Check runner health and system resources |
 | `update_all.sh` | Update all runners to latest version |

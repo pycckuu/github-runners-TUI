@@ -605,22 +605,38 @@ echo '{"workJobConcurrency":"4"}' > ~/.../runner/.runner.jitconfig
 
 ## Removing Runners
 
-This setup includes runner removal that handles both systemd services and GitHub registration. The removal process varies depending on whether `sudo ./svc.sh stop` works or not.
+The `remove_runner.sh` script handles runner removal from both local systemd services and GitHub. It includes automatic API fallback when local removal fails.
 
-### Method 1: Create a Removal Script (Recommended)
-
-Create a `remove_runner.sh` script in your `~/action-runners` directory:
+### Basic Usage
 
 ```bash
-# Create the removal script (copy the script content above)
-chmod +x remove_runner.sh
-
 # Remove a specific runner
 ./remove_runner.sh viaduct 2
 
 # Remove all runners for a repository
 ./remove_runner.sh viaduct all
 ```
+
+### With GitHub API Fallback
+
+When local removal fails (e.g., directory already deleted), the script can remove runners via GitHub CLI API:
+
+```bash
+# Explicit GitHub repo for API fallback
+./remove_runner.sh viaduct all --github-repo IgraLabs/viaduct
+
+# If not provided, you'll be prompted when API fallback is needed
+./remove_runner.sh viaduct 2
+# > GitHub repository not provided.
+# > Enter the full repository path (e.g., IgraLabs/viaduct):
+```
+
+The removal flow:
+1. Stop and disable systemd service (Linux)
+2. Uninstall using `svc.sh` if available
+3. Try `config.sh remove` (requires removal token)
+4. If step 3 fails, fall back to GitHub CLI API
+5. Optionally delete local directory
 
 ### Method 2: Manual Removal (When svc.sh fails)
 
